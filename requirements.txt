@@ -1,0 +1,9 @@
+mcp>=1.10,<2
+uvicorn>=0.30
+httpx>=0.27
+qqmusic-api-python>=0.5.0
+Pillow>=10.0
+# 网易云默认后端：本地库（QuickJS + 预编译动态库），不起容器/服务
+pymusiclibrary>=0.0.4
+# 本地渲染网易云登录二维码（SDK 引擎不返回 qrimg）
+qrcode>=7.4

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crates-mcp"
+version = "0.1.0"
+description = "Music MCP servers: QQ Music + NetEase auth, profile analysis, playlist creation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "crates"}]
+dependencies = [
+    "mcp>=1.10,<2",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "qqmusic-api-python>=0.5.0",
+    "Pillow>=10.0",
+    # 网易云默认后端：本地库（QuickJS + 预编译动态库），不起容器/服务
+    "pymusiclibrary>=0.0.4",
+    # 本地渲染网易云登录二维码（SDK 引擎不返回 qrimg）
+    "qrcode>=7.4",
+]
+
+[project.optional-dependencies]
+# 以前的写法 "pymusic-library>=0.1.0" 在 PyPI 上是 404（真名 pymusiclibrary，
+# 没有连字符，0.0.4 起才有 win/manylinux 轮子），所以 sdk 后端从来没装成过。
+sdk = ["pymusiclibrary>=0.0.4", "qrcode>=7.4"]  # 现在已是默认依赖，保留别名不破坏旧用法
+
+[project.scripts]
+crates-music = "music_mcp.app:main_all"
+crates-auth = "music_mcp.app:main"
+crates-profile = "music_mcp.app:main_profile"
+crates-playlist = "music_mcp.app:main_playlist"
+
+[tool.setuptools]
+# 别忘了子包：漏了 platforms 打出来的轮子会缺整个平台层
+packages = ["music_mcp", "music_mcp.platforms"]
+
+[tool.setuptools.package-data]
+music_mcp = ["*.md"]

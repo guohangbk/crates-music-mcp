@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 本地数据：凭证 / 状态 / 一次性二维码 —— 含登录态，绝不提交
+.data/
+
+# 编辑器
+.idea/
+.vscode/
