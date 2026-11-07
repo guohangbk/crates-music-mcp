@@ -20,14 +20,33 @@ Windows / Linux 行为一致——三平台的协议都是纯 Python 实现的�
 
 ## 一分钟跑通
 
+**推荐**：直接从仓库装，不用先克隆：
+
 ```bash
-pip install .            # 或 pip install git+https://github.com/<owner>/crates-music-mcp.git
+pip install git+https://github.com/guohangbk/crates-music-mcp.git
 ```
+
+如果卡在 `Could not connect to server`（国内直连 github.com:443 经常被挡），两个办法：
+挂代理，或改用 SSH 地址：
+
+```bash
+pip install "git+ssh://git@github.com/guohangbk/crates-music-mcp.git"
+```
+
+或者克隆下来再装 —— 想改代码、跑自检就用这种：
+
+```bash
+git clone https://github.com/guohangbk/crates-music-mcp.git   # 连不上就用 git@github.com:guohangbk/crates-music-mcp.git
+cd crates-music-mcp
+pip install -e .
+```
+
+> 目前**还没发布到 PyPI**，所以没有 `pip install crates-music-mcp` 这条路；上面两种是现在就能用的。
 
 装完得到 4 个命令：
 
 ```bash
-crates-music      # 单 server，全部 21 个工具（默认 stdio）—— 推荐
+crates-music      # 单 server，全部 27 个工具（默认 stdio）—— 推荐
 crates-auth       # 只带登录/凭证工具
 crates-profile    # 只带画像工具
 crates-playlist   # 只带建单/推荐工具
@@ -189,7 +208,7 @@ music_mcp/
         ├── ncm_crypto.py    网易云 · 参数加密：weapi（双层 AES + 裸 RSA）/ eapi（AES-ECB + md5）
         ├── ncm_native.py    网易云 · 路由与请求：域名、参数、指纹 Cookie、响应归一
         ├── kugou_crypto.py  酷狗 · 签名/加密：md5 盐值签名、两种 RSA、三处 AES、设备指纹
-        └── kugou_native.py  酷狗 · 路由与请求：13 条上游接口
+        └── kugou_native.py  酷狗 · 路由与请求：14 条上游接口
 ```
 
 一句话分工：
@@ -203,11 +222,6 @@ music_mcp/
 
 新增一个平台 = 一个 `x_crypto.py` + 一个 `x_native.py`（放 `core/`）+ 一个 `x.py`（放 `platforms/`），
 再加一行注册。
-
-## 许可证
-
-[MIT](LICENSE)。三个平台的上游实现同样是 MIT（见上表）——**我们只对齐了协议行为、没有复制它们的代码**：
-网易云/酷狗的签名与加密都是照公开协议自己实现的，QQ 那个库是以依赖形式引入的。
 
 ## 开发
 
@@ -230,19 +244,8 @@ CI（`.github/workflows/ci.yml`）在每次 push / PR 跑 **离线**自检：
 联网那部分（`NCM_LIVE=1` / `KUGOU_LIVE=1`）故意不进 CI：需要真实账号凭证，而且 CI 机房在境外、
 访问国内音乐接口不稳定，跑出来是假红。要验联网就看「自检」那一节，在本地跑。
 
-## 发布到 PyPI
 
-仓库里带了 `.github/workflows/publish.yml`，用 **Trusted Publishing**（OIDC）——**不需要在仓库里存 token**。
-要发布需要先在 PyPI 侧配一次：
+## 许可证
 
-1. 在 [PyPI](https://pypi.org/manage/account/publishing/) 加一个 *pending publisher*：
-   Owner `guohangbk`、Repository `crates-music-mcp`、Workflow `publish.yml`、Environment `pypi`
-   （TestPyPI 上用同一个路径再配一份，Environment 填 `testpypi`）；
-2. 在 GitHub 仓库的 Settings → Environments 建两个环境：`pypi` 与 `testpypi`
-   （想加人工审批就在 `pypi` 上配 required reviewers）；
-3. 先练手：Actions → **Publish** → Run workflow → 选 `testpypi`；
-4. 正式发：在 GitHub 上发一个 Release（会触发 `published`），或在 workflow 里选 `pypi`。
-
-版本号在 `pyproject.toml` 的 `version`，发之前记得改；PyPI 不允许覆盖同名版本。
-
-
+[MIT](LICENSE)。三个平台的上游实现同样是 MIT——**我们只对齐了协议行为、没有复制它们的代码**：
+网易云/酷狗的签名与加密都是照公开协议自己实现的，QQ 那个库是以依赖形式引入的。
