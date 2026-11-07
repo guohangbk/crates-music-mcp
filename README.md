@@ -2,7 +2,7 @@
 
 > ### 把你三个音乐 App 的收藏交给 Agent，让它每天替你挑一张对味的歌单。
 >
-> **网易云 · QQ 音乐 · 酷狗** —— 一个 MCP server、21 个工具、一份共享凭证、**零原生依赖**。
+> **网易云 · QQ 音乐 · 酷狗** —— 一个 MCP server、27 个工具、一份共享凭证、**零原生依赖**。
 
 大多数"音乐 MCP"只做一件事：把接口包一层，让模型能搜歌。这个包多做两步——
 **先读懂你的耳朵，再替你选歌**：
@@ -54,7 +54,7 @@ Agent：analyze_music_profile → 画像：偏爱华语流行 + 电子，常听 
        → 网易云《20261107-独处时光》40 首 / QQ音乐 40 首 / 酷狗 40 首
 ```
 
-## 21 个工具
+## 27 个工具
 
 **登录与凭证（8）**
 `login_methods` · `login_start` · `login_poll` · `login_submit` · `credential_status` · `credential_refresh` · `credential_set_cookie` · `credential_logout`
@@ -62,8 +62,19 @@ Agent：analyze_music_profile → 画像：偏爱华语流行 + 电子，常听 
 **画像与听歌数据（4）**
 `analyze_music_profile` · `get_profile` · `save_profile` · `recent_tracks`
 
-**歌单与推荐（9）**
-`create_daily_playlist` · `create_qq_playlist` · `create_ncm_playlist` · `create_kugou_playlist` · `daily_recommendations` · `ncm_liked_songs` · `delete_playlist` · `my_playlists` · `qq_recent`
+**歌单、搜索与推荐（15）**
+`create_daily_playlist` · `create_qq_playlist` · `create_ncm_playlist` · `create_kugou_playlist` ·
+`liked_songs` · `ncm_liked_songs` · `search_songs` · `playlist_songs` · `add_songs_to_playlist` ·
+`recent_played` · `daily_recommendations` · `my_playlists` · `delete_playlist` ·
+`recent_recommended_tracks` · `qq_recent`
+
+三个工具容易混，先分清：
+
+| 工具 | 返回什么 | 不是什么 |
+| --- | --- | --- |
+| `liked_songs(service)` | 某平台**全部收藏**（「我喜欢」全量） | 不是统计摘要，也不是"最近听的" |
+| `recent_played(service)` | **用户最近听过的歌**（网易云听歌排行 / 酷狗听歌历史） | 不是我们推荐过的歌；QQ 暂不支持 |
+| `recent_recommended_tracks` / `recent_tracks` / `qq_recent` | **我们最近 14 天推荐过的歌**（建单去重用） | 与用户听歌历史无关（`qq_recent` 这名字是历史遗留，也不专指 QQ） |
 
 ## 登录
 
@@ -200,7 +211,7 @@ music_mcp/
 
 ```bash
 pip install -e .
-python tests/test_stdio.py all    # 冒烟：21 个工具
+python tests/test_stdio.py all    # 冒烟：27 个工具
 python tests/test_methods.py      # 登录方式目录 + Cookie 导入 + 凭证状态
 python tests/test_analyze_all.py  # 三平台画像（需要本地已有凭证）
 ```

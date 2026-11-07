@@ -22,7 +22,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import compose, login, qr, vault
+from . import compose, login, paths, qr, vault
 from .login import LOGIN_USAGE, login_sessions
 from .platforms import DEFAULT_ORDER, all_platforms, get_platform, resolve_keys
 from .platforms.core.base import Platform, Song, platform_of
@@ -104,7 +104,21 @@ def _resolve_method(service: Platform, method: str) -> str:
     return method or (platform.default_method if platform else "phone_code")
 
 
+def _quiet_http_logs() -> None:
+    """把 HTTP 客户端的 INFO 日志压掉。
+
+    httpx 在 INFO 级别会把**完整 URL** 打进日志，而酷狗的 token、网易云的 Cookie 都是
+    请求参数/头的一部分 —— 默认配置下这些会原样落到 MCP 客户端的 stderr 里。
+    这里只压这几个库，MCP 自己的日志（工具调用）保持原样。
+    """
+    import logging
+
+    for name in ("httpx", "httpcore", "urllib3", "niquests", "anyio", "asyncio"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def build_server(name: str) -> FastMCP:
+    _quiet_http_logs()
     # "all" = 一个 server 带全部工具（MCP 的常规形态）；其余三个是分体模式。
     parts = {"all": ("auth", "profile", "playlist"),
              "auth": ("auth",),
@@ -277,7 +291,11 @@ def build_server(name: str) -> FastMCP:
 
         @mcp.tool()
         async def recent_tracks() -> str:
-            """Tracks recommended in the last 14 days (deduplication context)."""
+            """**我们最近 14 天推荐过的歌**（建单去重用），不是用户的听歌历史。
+
+            ⚠️ 名字容易误会：想看"用户最近在听什么"要用 recent_played(service=...)；
+            这个工具只回答"我们推过哪些歌"，换了名字叫 recent_recommended_tracks。
+            """
             return _dump(compose.recent_tracks())
 
     if "playlist" in parts:
@@ -291,6 +309,14 @@ def build_server(name: str) -> FastMCP:
                 payload = json.loads(songs_json)
             except json.JSONDecodeError as exc:
                 return _dump({"ok": False, "error": f"invalid songs_json: {exc}"})
+            # 裸列表也认：{"songs":[...]} 和 [{...}] 两种写法都收，
+            # 以前只认前者，传成列表会直接抛 AttributeError 给模型看。
+            if isinstance(payload, list):
+                payload = {"songs": payload}
+            if not isinstance(payload, dict):
+                return _dump({"ok": False,
+                              "error": 'songs_json 要 JSON 对象或数组，例如 '
+                                       '{"songs":[{"name":"天后","artist":"陈势安"}]}'})
             songs = [Song(str(item.get("name") or ""), str(item.get("artist") or ""))
                      for item in (payload.get("songs") or []) if isinstance(item, dict)]
             if isinstance(payload.get("playlist_name"), str) and not playlist_name:
@@ -350,7 +376,11 @@ def build_server(name: str) -> FastMCP:
 
         @mcp.tool()
         async def qq_recent() -> str:
-            """Recent 14-day recommended tracks (deduplication context)."""
+            """⚠️ 名字误导：与 QQ 平台无关，返回的也不是听歌历史。
+
+            它是 recent_recommended_tracks 的旧名字（我们最近 14 天推荐过的歌，用于去重），
+            保留只为兼容老提示词。想要"用户最近听过的歌"用 recent_played(service=...)。
+            """
             return _dump(compose.recent_tracks())
 
         @mcp.tool()
@@ -405,22 +435,147 @@ def build_server(name: str) -> FastMCP:
                                                          date, prompt, include, with_weather)
             return _dump(_with_login_options(result))
 
-        @mcp.tool()
-        async def ncm_liked_songs() -> str:
-            """Fetch Netease liked/created playlists as [{name,artist}] JSON."""
-            platform = get_platform(Platform.NETEASE)
+        async def _liked_songs(service: Platform, limit: int = 0) -> dict[str, Any]:
+            """收藏工具的公共实现：拉某平台的全部收藏（不是摘要）。"""
+            platform = get_platform(service)
+            if platform is None:
+                return {"ok": False, "error": f"unknown service: {service}"}
             songs, sources, diag = await platform.favorites()
+            snapshot_at = ""
+            if songs:
+                snapshot = compose.save_liked(platform.key.value, songs, sources)
+                snapshot_at = str(snapshot.get("updated_at") or "")
+            returned = songs[:limit] if limit and limit > 0 else songs
+            return _with_login_options({
+                "ok": bool(songs), "service": platform.key.value,
+                "count": len(songs), "returned": len(returned), "sources": sources,
+                "songs": [song.as_dict() for song in returned],
+                "snapshot": str(paths.liked_file(platform.key.value)) if songs else "",
+                "snapshot_updated_at": snapshot_at,
+                "diagnostics": diag, "need_login": bool(diag.get("need_login"))})
+
+        @mcp.tool()
+        async def liked_songs(service: Platform = Platform.KUGOU, limit: int = 0) -> str:
+            """某个平台**全部收藏**（「我喜欢」/收藏的歌单，全量，不是统计摘要）。
+
+            service: qq_music | netease | kugou
+            limit:   0 = 全部；>0 只返回前 N 首（大账号如 QQ 700+ 首时可截断）
+            Returns {"ok","service","count","returned","sources",
+                     "songs":[{"name","artist"}],"snapshot","diagnostics","need_login"}.
+            同时把快照写进 state/<platform>_liked.json（与建歌单流程同一口径）。
+            """
+            return _dump(await _liked_songs(service, limit))
+
+        @mcp.tool()
+        async def ncm_liked_songs(limit: int = 0) -> str:
+            """网易云收藏（等价于 liked_songs(service='netease')，保留是为了兼容老提示词）。"""
+            return _dump(await _liked_songs(Platform.NETEASE, limit))
+
+        @mcp.tool()
+        async def search_songs(service: Platform, keyword: str, limit: int = 10) -> str:
+            """在某个平台搜歌，返回可直接喂给建单/加歌的候选。
+
+            service: qq_music | netease | kugou
+            keyword: 歌名、或「歌名 歌手」
+            limit:   返回条数（默认 10，最多 50）
+            Returns {"ok","service","count","songs":[{"name","artist","id","album"}]}。
+            id 是该平台的歌曲标识（QQ songid / 网易云 song id / 酷狗 hash）。
+            想确认"某首歌在平台上到底有没有、是哪一首"时用它。
+            """
+            platform = get_platform(service)
+            if platform is None:
+                return _dump({"ok": False, "error": f"unknown service: {service}"})
+            if not str(keyword or "").strip():
+                return _dump({"ok": False, "error": "keyword 为空"})
+            songs, diag = await platform.search_items(keyword, limit)
             return _dump(_with_login_options({
-                "ok": bool(songs), "service": platform.key.value, "sources": sources,
-                "songs": [song.as_dict() for song in songs], "diagnostics": diag,
+                "ok": bool(songs), "service": platform.key.value, "keyword": keyword,
+                "count": len(songs), "songs": songs, "diagnostics": diag,
                 "need_login": bool(diag.get("need_login"))}))
+
+        @mcp.tool()
+        async def playlist_songs(service: Platform, playlist_id: str,
+                                 limit: int = 0) -> str:
+            """读某个歌单的曲目（playlist_id 用 my_playlists 返回的 id）。
+
+            service: qq_music | netease | kugou
+            limit:   0 = 全部；>0 只返回前 N 首
+            Returns {"ok","service","playlist_id","count","songs":[{"name","artist"}]}。
+            用途：把某个歌单当"种子"做推荐（先读出来，再挑歌建新单），或核对歌单内容。
+            """
+            platform = get_platform(service)
+            if platform is None:
+                return _dump({"ok": False, "error": f"unknown service: {service}"})
+            pid = str(playlist_id or "").strip()
+            if not pid:
+                return _dump({"ok": False, "error": "playlist_id 为空"})
+            songs, diag = await platform.playlist_tracks(pid, limit)
+            return _dump(_with_login_options({
+                "ok": bool(songs), "service": platform.key.value, "playlist_id": pid,
+                "count": len(songs), "songs": [song.as_dict() for song in songs],
+                "diagnostics": diag, "need_login": bool(diag.get("need_login"))}))
+
+        @mcp.tool()
+        async def add_songs_to_playlist(service: Platform, playlist_id: str,
+                                        songs: str = "", count: int = 0) -> str:
+            """给**已有**歌单加歌（不会新建歌单）。
+
+            service:     qq_music | netease | kugou
+            playlist_id: my_playlists 返回的 id
+            songs:       「歌名 - 歌手」，逗号/分号/换行分隔；也接受列表 JSON。
+                         例如 "晴天 - 周杰伦, 海阔天空 - Beyond"
+            count:       最多加几首（0 = 全部）
+            Returns {"ok","service","playlist_id","added","matched","failed"}。
+            每首歌在目标平台现场搜索，找不到就跳过（记进 failed），不会塞错歌。
+            """
+            platform = get_platform(service)
+            if platform is None:
+                return _dump({"ok": False, "error": f"unknown service: {service}"})
+            pid = str(playlist_id or "").strip()
+            if not pid:
+                return _dump({"ok": False, "error": "playlist_id 为空"})
+            wanted = compose.parse_include(songs)
+            if not wanted:
+                return _dump({"ok": False, "error": "songs 为空（写成「歌名 - 歌手」，逗号分隔）"})
+            if count and count > 0:
+                wanted = wanted[:count]
+            return _dump(_with_login_options(await platform.add_tracks(pid, wanted)))
+
+        @mcp.tool()
+        async def recent_played(service: Platform, limit: int = 50) -> str:
+            """某个平台**你自己最近听过的歌**（听歌排行），不是我们推荐过的歌。
+
+            service: qq_music | netease | kugou（QQ 暂不支持，会返回 supported=false）
+            limit:   取多少首（默认 50）
+            Returns {"ok","service","count","songs":[{"name","artist"}],"details",
+                     "diagnostics"}；details 里带 play_count（网易云）/ played_at（酷狗）。
+            用途：拿它当"种子"——先看用户最近在听什么，再据此建一张新歌单。
+            """
+            platform = get_platform(service)
+            if platform is None:
+                return _dump({"ok": False, "error": f"unknown service: {service}"})
+            songs, diag = await platform.recently_played(limit)
+            return _dump(_with_login_options({
+                "ok": bool(songs), "service": platform.key.value, "count": len(songs),
+                "songs": [song.as_dict() for song in songs],
+                "details": diag.get("details", []), "diagnostics": diag,
+                "need_login": bool(diag.get("need_login"))}))
+
+        @mcp.tool()
+        async def recent_recommended_tracks() -> str:
+            """**我们最近 14 天推荐过的歌**（去重用），不是用户的听歌历史。
+
+            想看"用户最近在听什么"用 recent_played(service=...)。
+            """
+            return _dump(compose.recent_tracks())
 
         @mcp.tool()
         async def delete_playlist(service: Platform, playlist_id: str,
                                   confirm: bool = False) -> str:
             """删除一个自建歌单（不可逆）。
 
-            三个平台都支持：QQ（dirid）、网易云（id）、酷狗（listid）。
+            playlist_id 用 my_playlists 返回的 ``id``（三平台已统一：QQ 的 dirid、
+            网易云的 id、酷狗的 listid 都放在这个字段里）。
             必须传 confirm=True 才会真的执行；先不带 confirm 调用可查看歌单名做二次确认。
             """
             platform = get_platform(service)
@@ -432,8 +587,9 @@ def build_server(name: str) -> FastMCP:
             if not confirm:
                 playlists, diag = await platform.my_playlists()
                 target = next((p for p in playlists
-                               if str(p.get("dirid") or p.get("id") or p.get("listid") or "") == pid), None)
-                name = str((target or {}).get("title") or (target or {}).get("name") or "(未在列表中找到)")
+                               if str(p.get("id") or p.get("dirid") or p.get("listid") or "") == pid),
+                              None)
+                name = str((target or {}).get("name") or (target or {}).get("title") or "(未在列表中找到)")
                 return _dump({"ok": False, "needs_confirmation": True,
                               "service": platform.key.value, "playlist_id": pid,
                               "name": name,
