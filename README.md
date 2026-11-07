@@ -70,10 +70,10 @@ Agent：analyze_music_profile → 画像：偏爱华语流行 + 电子，常听 
 | 平台 | 方式 |
 | --- | --- |
 | QQ 音乐 | `phone_code`（默认）/ `mobile_qr` / `qq_qr` / `wx_qr` |
-| 网易云 | `cookie`（推荐）/ `phone_code` / `qr` |
-| 酷狗 | `qr`（默认）/ `phone_code` |
+| 网易云 | `phone_code`（默认）/ `cookie` / `qr` |
+| 酷狗 | `phone_code`（默认）/ `qr` |
 
-最省事的是手机验证码（全程纯文本、无二维码、跨设备零差异）：
+三端都默认手机验证码（纯文本、不用截图扫码、跨设备零差异）：
 
 ```
 login_start(service="qq_music", method="phone_code", phone="138...")
