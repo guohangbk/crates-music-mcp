@@ -102,8 +102,27 @@ create_daily_playlist(include="晴天 - 周杰伦", count=20)     # 点名的歌
 
 `mcp` / `qqmusic-api-python` / `pymusiclibrary` / `qrcode` / `Pillow` / `httpx` / `uvicorn`，由 `pyproject.toml` 声明，pip 自动装齐。
 
-- 网易云走本地 `pymusiclibrary`（QuickJS + 预编译动态库），不需要容器
-- 酷狗引擎调用走一次性子进程，崩溃不污染主进程
+- 网易云**默认走纯 Python 后端**：自己算 weapi/eapi 参数直连官方 WebAPI，零原生依赖，
+  Linux 上照样跑，不需要容器、不需要 `pymusiclibrary`
+- 酷狗引擎调用走一次性子进程，崩溃不污染主进程（这条仍然依赖 `pymusiclibrary`）
+
+### 网易云后端：只有一套，纯 Python
+
+`music_mcp/platforms/ncm_native.py`（路由）+ `ncm_crypto.py`（weapi/eapi 加密）直连官方
+WebAPI，**零原生依赖、不需要容器**，Windows / Linux 行为一致。
+
+以前这里还有两条路，都删了：本地 `MusicLibrary` 引擎（pymusiclibrary 的 manylinux
+wheel 里装的是 Windows DLL，Linux 上永远起不来）和 ncm-api sidecar 容器（要多养一个服务）。
+`NCM_BACKEND` 环境变量现在只做兼容：设了别的值也照样走这一套，只在 stderr 提示一句。
+
+想确认当前用的是哪套：`make_ncm_client().backend`（恒为 `native`），或看
+`credential_status` 里 netease 的 `backend` 字段。离线自检（不需要凭证、不需要网络）：
+
+```bash
+python tests/test_ncm_native.py              # AES/RSA/weapi/eapi 结构与官方向量
+NCM_LIVE=1 python tests/test_ncm_native.py   # 加打一次真实搜索/推荐，验加密是否被上游接受
+```
+
 
 ## 开发
 
