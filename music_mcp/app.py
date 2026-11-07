@@ -4,8 +4,7 @@ Environment:
   MCP_SERVER  all | auth | profile | playlist   (all = 一个 server 带全部工具)
   PORT        HTTP port                   (default 8765)
   TRANSPORT    stdio | http               (default: stdio for entry points, http for -m)
-  NCM_BACKEND    sdk (default, 本地库，不起容器) | http
-  NCM_API_BASE   http://ncm-api:3000    (只有 NCM_BACKEND=http 时才用，legacy 容器)
+  NCM_BACKEND    已废弃，只剩纯 Python 一套后端（设了别的值也照样走 native，仅提示一句）
   MUSIC_DATA_DIR             数据根目录（凭证 + 状态）；默认用户级目录，不写进安装目录
   MUSIC_SECRETS_DIR / MUSIC_STATE_DIR   旧的分别覆盖写法，仍兼容（容器里由 compose 指定）
 

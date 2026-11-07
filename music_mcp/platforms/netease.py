@@ -1,32 +1,29 @@
 """网易云音乐的「基础能力」：登录、凭证、收藏、今日推荐、搜索、建歌单。
 
-后端是**自建**的本地库（MusicLibrary，QuickJS + 预编译动态库），不起容器、不起 sidecar：
-set NCM_BACKEND=http 时才回落到 HTTP 后端（NCM_API_BASE 指向一个 ncm-api 服务）。
+后端只有一套：**纯 Python 直连官方 WebAPI**（weapi/eapi 参数自己算），实现在
+`ncm_native.py`（路由层）与 `ncm_crypto.py`（加密层）。零原生依赖、不需要容器，
+Windows / Linux 一个样。
 
-文件里有两段代码，都是原样搬过来的，别随手"简化"：
-  * 上半段：两套后端的封装（同一套接口）；
-  * 下半段：ncm_* 业务函数（收藏/推荐/建单），以及 NeteasePlatform。
+历史提醒（别再往回加）：这里曾经有本地 `MusicLibrary` 引擎和 ncm-api sidecar 两条路，
+都删了 —— pymusiclibrary 的 manylinux wheel 里装的是 Windows DLL，Linux 上永远起不来；
+容器那条只是把同一套公开协议换个地方算，白多一个服务。
 
-踩过的坑（详见各函数注释）：引擎把多条 Set-Cookie 拼成一整段返回所以要正则扫；
-引擎的大歌单路由会踩内存把进程打崩所以曲目直连 WebAPI；引擎非线程安全所以要固定单线程。
+踩过的坑（详见各函数注释）：歌单曲目直连老的明文 `/api/playlist/detail`（天然给完整
+tracks）；上游 405「操作频繁」要退避重试，搜索这类接口尤其凶。
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 
 from .. import vault
-from ..qr import data_url as qr_data_url
 from .base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
                    Platform, Song, dedupe, name_matches, normalize, song_key)
+from .ncm_native import NcmNativeClient
 
 _norm = normalize  # 旧代码里的名字
 
@@ -37,12 +34,6 @@ NCM_AUTH_HINT = ("网易云未登录或 Cookie 已失效：优先 credential_set
 REC_PLAYLIST_LIMIT = 3      # 最多解析几个推荐歌单
 REC_PLAYLIST_TRACKS = 50    # 每个推荐歌单最多取多少首
 
-
-
-
-
-
-BASE = os.environ.get("NCM_API_BASE", "http://ncm-api:3000").rstrip("/")
 
 # 上游「需要登录」的返回码：api-enhanced 与 SDK 都沿用 301/302。
 AUTH_CODES = {301, 302}
@@ -78,6 +69,9 @@ def rate_limited(payload: dict[str, Any]) -> bool:
 # 撞上 405 限流后的退避序列（秒）；最后一个用完还不行就报 NcmRateLimitError。
 RATE_BACKOFF = (2.0, 5.0, 10.0, 20.0)
 
+# 废弃的 NCM_BACKEND 只提示一次（make_ncm_client 每次操作都会被调一次）。
+_WARNED_LEGACY = [False]
+
 
 # 网易云的曲库 id：key 是 song_key(歌名, 歌手)。
 # 收藏和今日推荐本来就带回了 id，顺手存下来，建歌单时能直接命中，省掉一次 search ——
@@ -96,20 +90,6 @@ def _remember(song: dict[str, Any]) -> None:
     artists = song.get("ar") or song.get("artists") or [{}]
     artist = str(artists[0].get("name") or "").strip() if artists else ""
     _KNOWN_IDS[song_key(name, artist)] = song_id
-
-
-def _cookie_to_dict(cookie: str) -> dict[str, str]:
-    """`MUSIC_U=x; __csrf=y` -> dict —— SDK 只接受 dict 形式的 cookie。"""
-    items: dict[str, str] = {}
-    for part in str(cookie or "").split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        key, _, value = part.partition("=")
-        key = key.strip()
-        if key and key.lower() not in _COOKIE_ATTRS:
-            items[key] = value.strip()
-    return items
 
 
 def _cookies_to_string(values: Any) -> str:
@@ -133,36 +113,6 @@ def _cookies_to_string(values: Any) -> str:
             seen.add(key)
             pairs.append(f"{key}={value}")
     return "; ".join(pairs)
-
-
-def _set_cookie_values(headers: Any) -> list[str]:
-    if not isinstance(headers, dict):
-        return []
-    for key in ("Set-Cookie", "set-cookie", "SET-COOKIE"):
-        value = headers.get(key)
-        if isinstance(value, list):
-            return [str(item) for item in value]
-        if value:
-            return [str(value)]
-    return []
-
-
-class HeaderShim:
-    """让 `_extract_cookie` 同时吃得下 httpx 响应与 SDK 响应。"""
-
-    def __init__(self, values: list[str] | None = None):
-        self._values = list(values or [])
-
-    @property
-    def headers(self) -> "HeaderShim":
-        return self
-
-    def get_list(self, name: str) -> list[str]:
-        return list(self._values)
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 
 # 官方 WebAPI（明文 /api，无需 weapi 加密）。
@@ -210,351 +160,24 @@ def _extract_cookie(payload: dict[str, Any], response: httpx.Response) -> str:
     return cookie.strip()
 
 
-class NcmApiClient:
-    backend = "http"
+def make_ncm_client(cookie: str = "", base: str | None = None) -> NcmNativeClient:
+    """网易云客户端工厂 —— 只有一套实现：纯 Python 直连官方 WebAPI。
 
-    def __init__(self, base: str | None = None, cookie: str | None = None):
-        self.base = (base or BASE).rstrip("/")
-        self.cookie = cookie or ""
+    这里曾经有三套后端（本地 MusicLibrary 引擎 / ncm-api sidecar 容器 / 现在这个），
+    靠 `NCM_BACKEND` 切来切去。两条老路现在都删了：
 
-    async def _get(self, path: str, **params: Any) -> tuple[dict[str, Any], httpx.Response]:
-        params.setdefault("timestamp", _now_ms())
-        headers = {"Cookie": self.cookie} if self.cookie else {}
-        payload: dict[str, Any] = {}
-        response: httpx.Response | None = None
-        for backoff in (0.0, *RATE_BACKOFF):
-            if backoff:
-                await asyncio.sleep(backoff)
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(f"{self.base}{path}", params=params, headers=headers)
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {"code": response.status_code, "raw": response.text[:300]}
-            if not rate_limited(payload):
-                return payload, response
-        raise NcmRateLimitError(f"网易云限流：{path} 连试 {len(RATE_BACKOFF) + 1} 次都返回 405")
+      * 引擎：pymusiclibrary 的 manylinux wheel 里装的是 Windows DLL，Linux 上永远起不来；
+      * 容器：加密和路由本来就是公开协议（见 ncm_crypto.py），没必要再多跑一个服务。
 
-    # ---------------- auth ----------------
-
-    async def login_status(self) -> dict[str, Any]:
-        payload, _ = await self._get("/login/status", cookie=self.cookie)
-        return payload
-
-    @staticmethod
-    def _raise_if_auth_failed(payload: dict[str, Any]) -> None:
-        if payload.get("code") in AUTH_CODES:
-            raise NcmAuthError(f"网易云未登录或 Cookie 已失效（code={payload.get('code')}）")
-
-    async def refresh_cookie(self) -> tuple[str, dict[str, Any]]:
-        payload, response = await self._get("/login/refresh", cookie=self.cookie)
-        return _extract_cookie(payload, response), payload
-
-    async def qr_key(self) -> str:
-        payload, _ = await self._get("/login/qr/key")
-        data = payload.get("data") or {}
-        return str(data.get("unikey") or data.get("key") or "")
-
-    async def qr_create(self, key: str) -> str:
-        """Return a base64 PNG data URL (api-enhanced supports qrimg=true)."""
-        payload, _ = await self._get("/login/qr/create", key=key, qrimg=True)
-        data = payload.get("data") or {}
-        return str(data.get("qrimg") or data.get("qrurl") or "")
-
-    async def qr_check(self, key: str) -> tuple[int, str, dict[str, Any], httpx.Response]:
-        payload, response = await self._get("/login/qr/check", key=key)
-        return int(payload.get("code") or 0), str(payload.get("message") or ""), payload, response
-
-    async def captcha_sent(self, phone: str, ctcode: int = 86) -> dict[str, Any]:
-        payload, _ = await self._get("/captcha/sent", phone=phone, ctcode=ctcode)
-        return payload
-
-    async def captcha_verify(self, phone: str, code: str, ctcode: int = 86) -> dict[str, Any]:
-        payload, _ = await self._get("/captcha/verify", phone=phone, code=code, ctcode=ctcode)
-        return payload
-
-    async def login_cellphone(self, phone: str, code: str, ctcode: int = 86) -> tuple[str, dict[str, Any], httpx.Response]:
-        payload, response = await self._get("/login/cellphone", phone=phone, captcha=code,
-                                           ctcode=ctcode)
-        return _extract_cookie(payload, response), payload, response
-
-    # ---------------- data ----------------
-
-    async def user_playlists(self, uid: str) -> list[dict[str, Any]]:
-        payload, _ = await self._get("/user/playlist", uid=uid)
-        return list(payload.get("playlist") or [])
-
-    async def playlist_tracks(self, playlist_id: int, limit: int = 1000,
-                              max_pages: int = 50) -> list[dict[str, Any]]:
-        """All tracks of a playlist, paged explicitly.
-
-        Upstream defaults to ``limit=1000, offset=0``, so a 1000+ song playlist
-        would be silently truncated — page it instead of trusting the default.
-        """
-        songs: list[dict[str, Any]] = []
-        for page in range(max_pages):
-            payload, _ = await self._get("/playlist/track/all", id=playlist_id,
-                                         limit=limit, offset=page * limit)
-            self._raise_if_auth_failed(payload)
-            batch = [song for song in payload.get("songs") or [] if isinstance(song, dict)]
-            songs.extend(batch)
-            if len(batch) < limit:
-                break
-        return songs
-
-    # ---------------- playlist write ----------------
-
-    async def cloud_search(self, keyword: str, limit: int = 5, offset: int = 0) -> list[dict[str, Any]]:
-        """Search songs by keyword. Anonymous-safe; used to resolve name -> id."""
-        payload, _ = await self._get("/cloudsearch", keywords=keyword, type=1,
-                                     limit=limit, offset=offset)
-        self._raise_if_auth_failed(payload)
-        result = payload.get("result")
-        songs = result.get("songs") if isinstance(result, dict) else None
-        return [song for song in songs or [] if isinstance(song, dict)]
-
-    async def playlist_create(self, name: str, privacy: int = 0) -> tuple[int, dict[str, Any]]:
-        payload, _ = await self._get("/playlist/create", name=name, privacy=privacy)
-        self._raise_if_auth_failed(payload)
-        created = payload.get("playlist") if isinstance(payload.get("playlist"), dict) else {}
-        try:
-            playlist_id = int(payload.get("id") or created.get("id") or 0)
-        except (TypeError, ValueError):
-            playlist_id = 0
-        return playlist_id, payload
-
-    async def playlist_track_add(self, playlist_id: int, song_ids: list[int]) -> dict[str, Any]:
-        ids = ",".join(str(int(song_id)) for song_id in song_ids if song_id)
-        # 加歌走 /playlist/tracks?op=add；/playlist/track/add 是「视频歌单」的接口，会回 401。
-        payload, _ = await self._get("/playlist/tracks", op="add", pid=playlist_id, tracks=ids)
-        self._raise_if_auth_failed(payload)
-        return payload
-
-    async def playlist_delete(self, playlist_id: int) -> dict[str, Any]:
-        payload, _ = await self._get("/playlist/delete", id=int(playlist_id))
-        self._raise_if_auth_failed(payload)
-        return payload
-
-    # ---------------- 平台推荐（今日推荐歌单 / 日推歌曲） ----------------
-
-    async def daily_songs(self) -> list[dict[str, Any]]:
-        """每日推荐歌曲（/recommend/songs）。"""
-        payload, _ = await self._get("/recommend/songs")
-        data = payload.get("data")
-        songs = data.get("dailySongs") if isinstance(data, dict) else None
-        return [song for song in songs or [] if isinstance(song, dict)]
-
-    async def recommend_playlists(self, limit: int = 10) -> list[dict[str, Any]]:
-        """推荐歌单。登录用 /recommend/resource，未登录回落到 /personalized。"""
-        payload, _ = await self._get("/recommend/resource")
-        playlists = payload.get("recommend")
-        if auth_failed(payload) or not playlists:
-            payload, _ = await self._get("/personalized", limit=limit)
-            playlists = payload.get("result")
-        return [item for item in playlists or [] if isinstance(item, dict)][:limit]
-
-
-# ---------------------------------------------------------------------------
-# SDK backend: MusicLibrary (QuickJS + 预编译库) —— 本地跑，不起容器
-# ---------------------------------------------------------------------------
-
-# 库自己声明「接口对象不能跨线程使用」，所以固定一条工作线程 + 缓存一个实例。
-_SDK_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ncm-sdk")
-_SDK_LOCK = threading.Lock()
-_SDK_API: Any = None
-
-
-def _sdk_api():
-    global _SDK_API
-    with _SDK_LOCK:
-        if _SDK_API is None:
-            from MusicLibrary.neteaseCloudMusicApi import NeteaseCloudMusicApi
-
-            _SDK_API = NeteaseCloudMusicApi()
-        return _SDK_API
-
-
-class NcmSdkClient:
-    """Same interface as :class:`NcmApiClient`, backed by the local bindings."""
-
-    backend = "sdk"
-    # 两次调用之间留最小间隔，撞上 405 再按 RATE_BACKOFF 退避重试。
-    MIN_INTERVAL = 1.0
-    _last_call = 0.0  # 类级：所有实例共用同一个 SDK 工作线程
-
-    def __init__(self, cookie: str = "", base: str | None = None):
-        self.cookie = (cookie or "").strip()
-
-    async def _drive(self, run: Callable[[], Any], label: str, timeout: float
-                     ) -> tuple[dict[str, Any], HeaderShim]:
-        """带节流和限流退避的执行器：所有 SDK 调用都从这里出去。"""
-        loop = asyncio.get_running_loop()
-        payload: dict[str, Any] = {}
-        shim = HeaderShim([])
-        for backoff in (0.0, *RATE_BACKOFF):
-            if backoff:
-                await asyncio.sleep(backoff)
-            gap = self.MIN_INTERVAL - (time.monotonic() - NcmSdkClient._last_call)
-            if gap > 0:
-                await asyncio.sleep(gap)
-            try:
-                raw = await asyncio.wait_for(loop.run_in_executor(_SDK_EXECUTOR, run),
-                                             timeout=timeout)
-            finally:
-                NcmSdkClient._last_call = time.monotonic()
-            payload, shim = self._adapt(raw)
-            if not rate_limited(payload):
-                return payload, shim
-        raise NcmRateLimitError(
-            f"网易云限流：{label} 连试 {len(RATE_BACKOFF) + 1} 次都返回 405")
-
-    async def _call(self, route: str, timeout: float = 40.0,
-                    **kwargs: Any) -> tuple[dict[str, Any], HeaderShim]:
-        # 参数名必须叫 route：叫 name 会和 /playlist/create?name=... 这种路由参数撞名，
-        # 报 "got multiple values for argument 'name'"，建歌单直接废掉。
-        cookie = _cookie_to_dict(self.cookie)
-        return await self._drive(
-            lambda: getattr(_sdk_api(), route)(cookie=cookie, **kwargs), route, timeout)
-
-    async def _request(self, path: str, timeout: float = 40.0,
-                       **query: Any) -> tuple[dict[str, Any], HeaderShim]:
-        """按路由字符串直接打：库里没包成方法的路由（如 /cloudsearch）走这条。"""
-        cookie = _cookie_to_dict(self.cookie)
-        return await self._drive(
-            lambda: _sdk_api().request(path, cookie, **query), path, timeout)
-
-    @staticmethod
-    def _adapt(raw: Any) -> tuple[dict[str, Any], HeaderShim]:
-        payload = dict(getattr(raw, "body", None) or {})
-        values = _set_cookie_values(getattr(raw, "headers", None))
-        shim = HeaderShim(values)
-        body_cookie = payload.get("cookie")
-        joined = _cookies_to_string(body_cookie) if body_cookie else ""
-        if not joined and values:
-            joined = _cookies_to_string(values)
-        if joined:
-            payload["cookie"] = joined
-        return payload, shim
-
-    @staticmethod
-    def _raise_if_auth_failed(payload: dict[str, Any]) -> None:
-        if auth_failed(payload):
-            raise NcmAuthError(f"网易云未登录或 Cookie 已失效（code={payload.get('code')}）")
-
-    # ---------------- auth ----------------
-
-    async def login_status(self) -> dict[str, Any]:
-        payload, _ = await self._call("login_status")
-        return payload
-
-    async def refresh_cookie(self) -> tuple[str, dict[str, Any]]:
-        payload, shim = await self._call("login_refresh")
-        return _extract_cookie(payload, shim), payload
-
-    async def qr_key(self) -> str:
-        payload, _ = await self._call("login_qr_key")
-        data = payload.get("data") or {}
-        return str(data.get("unikey") or data.get("key") or "")
-
-    async def qr_create(self, key: str) -> str:
-        """SDK 引擎不返回 qrimg，只有登录链接 —— 本地渲染成二维码。"""
-        payload, _ = await self._call("login_qr_create", key=key)
-        data = payload.get("data") or {}
-        return str(data.get("qrimg") or "") or qr_data_url(str(data.get("qrurl") or ""))
-
-    async def qr_check(self, key: str) -> tuple[int, str, dict[str, Any], HeaderShim]:
-        payload, shim = await self._call("login_qr_check", key=key)
-        return int(payload.get("code") or 0), str(payload.get("message") or ""), payload, shim
-
-    async def captcha_sent(self, phone: str, ctcode: int = 86) -> dict[str, Any]:
-        payload, _ = await self._call("captcha_sent", phone=phone, ctcode=ctcode)
-        return payload
-
-    async def captcha_verify(self, phone: str, code: str, ctcode: int = 86) -> dict[str, Any]:
-        payload, _ = await self._call("captcha_verify", phone=phone, captcha=code, ctcode=ctcode)
-        return payload
-
-    async def login_cellphone(self, phone: str, code: str,
-                              ctcode: int = 86) -> tuple[str, dict[str, Any], HeaderShim]:
-        payload, shim = await self._call("login_cellphone", phone=phone, captcha=code,
-                                         countrycode=ctcode)
-        return _extract_cookie(payload, shim), payload, shim
-
-    # ---------------- data ----------------
-
-    async def user_playlists(self, uid: str) -> list[dict[str, Any]]:
-        payload, _ = await self._call("user_playlist", uid=str(uid), limit=1000)
-        return [item for item in payload.get("playlist") or [] if isinstance(item, dict)]
-
-    async def playlist_tracks(self, playlist_id: int, limit: int = 1000,
-                              max_pages: int = 50) -> list[dict[str, Any]]:
-        # 引擎的 /playlist/track/all 在大歌单上必崩，直连 WebAPI（见 web_playlist_tracks）。
-        return await web_playlist_tracks(playlist_id, self.cookie, limit=limit)
-
-    async def cloud_search(self, keyword: str, limit: int = 5,
-                           offset: int = 0) -> list[dict[str, Any]]:
-        # 走 /cloudsearch（网页端那条搜索）：库包出来的 /search 是老的 search/get 接口，
-        # 限流极狠 —— 连发十来次就 405「操作频繁」，而且一挂就是十几分钟不放，实测
-        # /cloudsearch 在同一时刻照样能连发 12 次全部 200。
-        payload, _ = await self._request("/cloudsearch", keywords=keyword, type=1,
-                                         limit=limit, offset=offset)
-        self._raise_if_auth_failed(payload)
-        result = payload.get("result")
-        songs = result.get("songs") if isinstance(result, dict) else None
-        return [song for song in songs or [] if isinstance(song, dict)]
-
-    async def playlist_create(self, name: str, privacy: int = 0) -> tuple[int, dict[str, Any]]:
-        payload, _ = await self._call("playlist_create", name=name, privacy=privacy)
-        self._raise_if_auth_failed(payload)
-        created = payload.get("playlist") if isinstance(payload.get("playlist"), dict) else {}
-        try:
-            playlist_id = int(payload.get("id") or created.get("id") or 0)
-        except (TypeError, ValueError):
-            playlist_id = 0
-        return playlist_id, payload
-
-    async def playlist_track_add(self, playlist_id: int, song_ids: list[int]) -> dict[str, Any]:
-        ids = ",".join(str(int(song_id)) for song_id in song_ids if song_id)
-        # 见上：音乐歌单用 /playlist/tracks?op=add。
-        payload, _ = await self._call("playlist_tracks", op="add", pid=playlist_id, tracks=ids)
-        self._raise_if_auth_failed(payload)
-        return payload
-
-    async def playlist_delete(self, playlist_id: int) -> dict[str, Any]:
-        """删除一个自建歌单（清理失败/半成品歌单用，不可逆）。"""
-        payload, _ = await self._call("playlist_delete", id=int(playlist_id))
-        self._raise_if_auth_failed(payload)
-        return payload
-
-    # ---------------- 平台推荐 ----------------
-
-    async def daily_songs(self) -> list[dict[str, Any]]:
-        payload, _ = await self._call("recommend_songs")
-        data = payload.get("data")
-        songs = data.get("dailySongs") if isinstance(data, dict) else None
-        return [song for song in songs or [] if isinstance(song, dict)]
-
-    async def recommend_playlists(self, limit: int = 10) -> list[dict[str, Any]]:
-        payload, _ = await self._call("recommend_resource")
-        playlists = payload.get("recommend")
-        if auth_failed(payload) or not playlists:
-            payload, _ = await self._call("personalized", limit=limit)
-            playlists = payload.get("result")
-        return [item for item in playlists or [] if isinstance(item, dict)][:limit]
-
-
-def make_ncm_client(cookie: str = "", base: str | None = None):
-    """Pick the backend: local SDK by default, container only if asked/needed."""
-    backend = str(os.environ.get("NCM_BACKEND") or "sdk").strip().lower()
-    if backend != "http":
-        try:
-            import MusicLibrary  # noqa: F401  (只做可用性探测)
-
-            return NcmSdkClient(cookie=cookie, base=base)
-        except ImportError as exc:
-            print(f"[ncm] 本地后端不可用（{exc}），回落到 HTTP 容器：{BASE}", file=sys.stderr,
-                  flush=True)
-    return NcmApiClient(base=base, cookie=cookie)
+    `NCM_BACKEND` 只做兼容 —— 设了别的值也照样走 native，只在 stderr 提示一次，
+    免得老部署里残留的环境变量让人误以为还在切后端。
+    """
+    legacy = str(os.environ.get("NCM_BACKEND") or "").strip().lower()
+    if legacy not in ("", "native") and not _WARNED_LEGACY[0]:
+        _WARNED_LEGACY[0] = True      # 每次调用都来一遍太吵，一个进程提示一次就够
+        print(f"[ncm] NCM_BACKEND={legacy} 已废弃（现在只有纯 Python 一套后端，"
+              f"native / 引擎 / 容器都不再切换），忽略", file=sys.stderr, flush=True)
+    return NcmNativeClient(cookie=cookie, base=base)
 
 
 async def ncm_credential(*, force: bool = False) -> str:
@@ -748,7 +371,9 @@ class NeteasePlatform(MusicPlatform):
     # ---------------- 凭证 ----------------
 
     def status(self) -> dict[str, Any]:
-        return vault.status()["netease"]
+        # 只有一套后端（纯 Python 直连），顺手报出来 —— agent 排查"为什么连不上"
+        # 时能一眼看到用的不是容器/引擎，省得去猜部署形态。
+        return {**vault.status()["netease"], "backend": "native"}
 
     def auth_hint(self) -> str:
         return NCM_AUTH_HINT

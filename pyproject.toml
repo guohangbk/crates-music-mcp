@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "crates-mcp"
+name = "crates-music-mcp"
 version = "0.1.0"
 description = "Music MCP servers: QQ Music + NetEase auth, profile analysis, playlist creation"
 readme = "README.md"
@@ -16,16 +16,17 @@ dependencies = [
     "httpx>=0.27",
     "qqmusic-api-python>=0.5.0",
     "Pillow>=10.0",
-    # 网易云默认后端：本地库（QuickJS + 预编译动态库），不起容器/服务
+    # 酷狗引擎（MusicLibrary/kuGouMusicApi）。网易云不吃这口：它走纯 Python 的
+    # ncm_native（自己算 weapi/eapi 直连官方 WebAPI），所以 Linux 上这个坏轮子
+    # （manylinux wheel 里塞的是 Windows DLL）只影响酷狗。
     "pymusiclibrary>=0.0.4",
-    # 本地渲染网易云登录二维码（SDK 引擎不返回 qrimg）
+    # 本地渲染网易云登录二维码（上游只回登录链接文本）
     "qrcode>=7.4",
 ]
 
-[project.optional-dependencies]
-# 以前的写法 "pymusic-library>=0.1.0" 在 PyPI 上是 404（真名 pymusiclibrary，
-# 没有连字符，0.0.4 起才有 win/manylinux 轮子），所以 sdk 后端从来没装成过。
-sdk = ["pymusiclibrary>=0.0.4", "qrcode>=7.4"]  # 现在已是默认依赖，保留别名不破坏旧用法
+# 没有 optional-dependencies：原来那个 sdk extra（"pymusic-library>=0.1.0"）在 PyPI
+# 上是 404（真名 pymusiclibrary，没有连字符，0.0.4 起才有 win/manylinux 轮子），
+# 而且网易云 SDK 后端已经删掉了 —— pymusiclibrary 现在只是酷狗引擎的运行时依赖。
 
 [project.scripts]
 crates-music = "music_mcp.app:main_all"
