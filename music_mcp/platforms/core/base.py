@@ -242,3 +242,27 @@ class MusicPlatform:
                               count: int) -> CreateResult:
         """把 songs 建成本平台的同名歌单；匹配不到的直接跳过，写进 failed。"""
         raise NotImplementedError
+
+    # ---------------- 搜索 / 歌单内容 / 最近播放 ----------------
+    # 四个都是「可选能力」：某个平台没有就返回 supported=False，让工具层如实转述，
+    # 不要假装成功。返回结构统一，免得模型为每个平台各记一套字段名。
+
+    async def search_items(self, keyword: str, limit: int = 10,
+                           ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """搜索歌曲，返回统一结构 [{"name","artist","id"}...]。"""
+        return [], {"supported": False, "error": f"{self.label}未实现搜索列表"}
+
+    async def playlist_tracks(self, playlist_id: str, limit: int = 0,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """读某个歌单的曲目。playlist_id 用 my_playlists 返回的 id。"""
+        return [], {"supported": False, "error": f"{self.label}未实现歌单曲目读取"}
+
+    async def add_tracks(self, playlist_id: str, songs: list[Song]) -> dict[str, Any]:
+        """把歌加进**已有**歌单（歌名 → 平台内搜索 → 加歌）。"""
+        return {"ok": False, "supported": False,
+                "error": f"{self.label}未实现给已有歌单加歌"}
+
+    async def recently_played(self, limit: int = 50,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """用户最近播放 / 听歌排行 —— 不是「我们推荐过什么」。"""
+        return [], {"supported": False, "error": f"{self.label}拿不到最近播放"}

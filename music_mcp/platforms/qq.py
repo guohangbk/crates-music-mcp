@@ -30,6 +30,9 @@ _norm = normalize  # 旧代码里的名字
 QQ_AUTH_HINT = ("QQ 音乐未登录或凭证不完整：login_start(service='qq_music', method='phone_code', "
                 "phone='...') 后 login_submit。")
 LIKED_TITLES = {"我喜欢", "我的收藏", "喜欢"}
+# 「我喜欢」的固定 dirid —— QQ 客户端把它硬编码成 201，实测自建歌单都是 90 多，
+# 所以这个值是判断"哪个歌单才是收藏"的结构化依据（名字只作兜底）。
+QQ_LIKED_DIRID = 201
 EXPIRED_CODES = {1000, 2001, 104400, 104401}
 REC_PLAYLIST_LIMIT = 3      # 最多解析几个推荐歌单
 REC_PLAYLIST_TRACKS = 50    # 每个推荐歌单最多取多少首
@@ -176,6 +179,22 @@ async def _qq_run(operation):
         credential = await qq_credential(force=True)
         return await operation(credential)
 
+def _pick_liked_qq(playlists: list[Any]) -> tuple[list[Any], str]:
+    """挑出「我喜欢」那个歌单，并说明是按什么挑中的。
+
+    优先级：固定 dirid(201) → 歌单名 → 第一个歌单。
+    只按名字挑会误判：用户自建歌单完全可以叫「我喜欢」；反过来账号换了昵称/语言后
+    名字也可能对不上，所以以结构化标记为主，名字只作兜底。
+    """
+    picked = [pl for pl in playlists if int(getattr(pl, "dirid", 0) or 0) == QQ_LIKED_DIRID]
+    if picked:
+        return picked, f"dirid={QQ_LIKED_DIRID}"
+    picked = [pl for pl in playlists if str(getattr(pl, "title", "") or "") in LIKED_TITLES]
+    if picked:
+        return picked, "title"
+    return ([playlists[0]], "first_playlist") if playlists else ([], "none")
+
+
 async def qq_liked_songs() -> tuple[list[tuple[str, str]], list[str], dict[str, Any]]:
     """Return (songs, sources, diagnostics). Never raises on an empty account."""
     diag: dict[str, Any] = {"musicid": None, "created_playlists": 0, "errors": []}
@@ -197,9 +216,8 @@ async def qq_liked_songs() -> tuple[list[tuple[str, str]], list[str], dict[str, 
             diag["created_playlists"] = len(playlists)
             titles = [str(getattr(pl, "title", "") or "") for pl in playlists]
             diag["playlist_titles"] = titles[:20]
-            targets = [pl for pl in playlists if str(getattr(pl, "title", "") or "") in LIKED_TITLES]
-            if not targets and playlists:
-                targets = [playlists[0]]
+            targets, picked_by = _pick_liked_qq(playlists)
+            diag["liked_picked_by"] = picked_by
             for pl in targets:
                 page, before = 1, len(songs)
                 api_total = None
@@ -619,6 +637,131 @@ class QQMusicPlatform(MusicPlatform):
 
         return await _qq_run(_create)
 
+    async def search_items(self, keyword: str, limit: int = 10,
+                           ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """搜索歌曲，返回统一结构。"""
+        async def _find(credential):
+            async with Client(credential=credential) as client:
+                result = await client.search.search_by_type(
+                    keyword=keyword.strip(), search_type=SearchType.SONG,
+                    num=max(1, min(int(limit or 10), 50)), page=1)
+            items: list[dict[str, Any]] = []
+            for row in list(getattr(result, "song", None) or []):
+                items.append({
+                    "name": _title(row),
+                    "artist": " / ".join(_artists(row)),
+                    "id": str(_song_id(row) or ""),
+                    "mid": str(getattr(row, "mid", "") or getattr(row, "songmid", "") or ""),
+                    "album": str(getattr(getattr(row, "album", None), "name", "")
+                                 or getattr(row, "album_name", "") or ""),
+                })
+            return items
+
+        return await _qq_run(_find), {}
+
+    async def playlist_tracks(self, playlist_id: str, limit: int = 0,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """读 QQ 歌单曲目。
+
+        ``get_detail`` 要的是**内部 id**，而对外暴露的 id 是 dirid（删除/加歌用），
+        所以先用 ``get_created_songlist`` 把 dirid 映射成内部 id（实测：传 dirid 回 0 首）。
+        """
+        pid = str(playlist_id or "").strip()
+        if not pid:
+            return [], {"error": "playlist_id 为空"}
+        if not vault.qq_is_complete(vault.get_qq()):
+            return [], {"need_login": True, "error": QQ_AUTH_HINT}
+
+        async def _fetch(credential):
+            musicid = int(getattr(credential, "musicid", 0) or 0)
+            async with Client(credential=credential) as client:
+                created = await client.user.get_created_songlist(uin=musicid,
+                                                                credential=credential)
+                target = next((pl for pl in list(getattr(created, "playlists", []) or [])
+                               if str(getattr(pl, "dirid", "") or "") == pid
+                               or str(getattr(pl, "id", "") or "") == pid), None)
+                if target is None:
+                    return [], {"error": f"没找到 dirid/id = {pid} 的歌单",
+                                "playlists": len(list(getattr(created, "playlists", []) or []))}
+                songs: list[Song] = []
+                page = 1
+                while page <= 100:
+                    detail = await client.songlist.get_detail(
+                        songlist_id=getattr(target, "id", 0), num=100, page=page)
+                    batch = list(getattr(detail, "songs", []) or [])
+                    for row in batch:
+                        name = _title(row)
+                        if name:
+                            artists = _artists(row)
+                            songs.append(Song(name, artists[0] if artists else ""))
+                    if not batch or not getattr(detail, "hasmore", False):
+                        break
+                    page += 1
+                trimmed = songs[:limit] if limit and limit > 0 else songs
+                return trimmed, {"total": len(songs),
+                                 "name": str(getattr(target, "title", "") or ""),
+                                 "internal_id": str(getattr(target, "id", "") or "")}
+
+        return await _qq_run(_fetch)
+
+    async def add_tracks(self, playlist_id: str, songs: list[Song]) -> dict[str, Any]:
+        """给已有歌单加歌（dirid + song_info）。匹配口径与 create_playlist 一致。"""
+        if not vault.qq_is_complete(vault.get_qq()):
+            return {"ok": False, "service": self.key.value, "need_login": True,
+                    "error": QQ_AUTH_HINT}
+        try:
+            dirid = int(str(playlist_id).strip())
+        except (TypeError, ValueError):
+            return {"ok": False, "service": self.key.value,
+                    "error": f"dirid 必须是数字，收到 {playlist_id!r}"}
+
+        async def _add(credential):
+            matched: list[tuple[int, int]] = []
+            matched_meta: list[dict[str, str]] = []
+            failed: list[str] = []
+            ids: set[int] = set()
+            async with Client(credential=credential) as client:
+                for song in songs:
+                    query = f"{song.name} {song.artist}".strip()
+                    try:
+                        result = await client.search.search_by_type(
+                            keyword=query, search_type=SearchType.SONG, num=5, page=1)
+                        chosen = _pick(list(getattr(result, "song", None) or []), song.artist,
+                                       ids, song.name)
+                    except Exception:  # noqa: BLE001 - 单首失败不该毁掉整批
+                        chosen = None
+                    song_id = _song_id(chosen) if chosen is not None else 0
+                    if not song_id:
+                        failed.append(query)
+                        continue
+                    ids.add(song_id)
+                    matched.append((song_id, 0))
+                    matched_meta.append(song.as_dict())
+                if not matched:
+                    return {"ok": False, "service": self.key.value, "playlist_id": str(dirid),
+                            "failed": failed, "error": "没有匹配到任何歌曲"}
+                added = await client.songlist.add_songs(dirid=dirid, song_info=matched,
+                                                        tid=0, credential=credential)
+            ok = bool(added)
+            return {"ok": ok, "service": self.key.value, "playlist_id": str(dirid),
+                    "added": len(matched) if ok else 0,
+                    "matched": matched_meta if ok else [], "failed": failed,
+                    "error": "" if ok else "QQ 拒绝了加歌请求"}
+
+        return await _qq_run(_add)
+
+    async def recently_played(self, limit: int = 50,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """QQ 音乐的「最近播放」暂时拿不到。
+
+        `qqmusic-api-python` 没有暴露听歌历史接口；自己拼 CGI 需要构造它内部的
+        ``RequestExecutor``（``CgiRequest`` 的 ``_executor`` 是私有参数），属于绕库内部实现，
+        升级就废。这里如实返回 supported=False，别假装成功。
+        """
+        return [], {"supported": False,
+                    "error": "QQ 音乐库未提供听歌历史；可用 my_playlists/playlist_songs 看收藏，"
+                             "或改用 qq_recent（注意那是我们最近推荐过的歌，不是听歌历史）"}
+
     async def delete_playlist(self, playlist_id: str) -> dict[str, Any]:
         """删除 QQ 音乐歌单（dirid）。"""
         if not vault.qq_is_complete(vault.get_qq()):
@@ -641,7 +784,7 @@ class QQMusicPlatform(MusicPlatform):
                     "service": self.key.value}
 
     async def my_playlists(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """列出 QQ 音乐创建的歌单。"""
+        """列出 QQ 音乐创建的歌单（统一字段：id / name / track_count）。"""
         diag: dict[str, Any] = {"errors": []}
         if not vault.qq_is_complete(vault.get_qq()):
             diag["need_login"] = True
@@ -651,9 +794,12 @@ class QQMusicPlatform(MusicPlatform):
             async with Client(credential=credential) as client:
                 result = await client.user.get_created_songlist(uin=musicid, credential=credential)
             playlists = list(getattr(result, "playlists", []) or [])
-            return [{"dirid": str(getattr(pl, "id", "") or ""),
-                     "title": str(getattr(pl, "title", "") or ""),
-                     "songnum": int(getattr(pl, "songnum", 0) or 0)}
+            # 统一字段名：id / name / track_count。
+            # id 用 **dirid**：QQ 的删除/加歌接口要的就是它（老代码这里是内部 id，
+            # 拿 my_playlists 的 id 去 delete_playlist 必然对不上）。
+            return [{"id": str(getattr(pl, "dirid", "") or ""),
+                     "name": str(getattr(pl, "title", "") or ""),
+                     "track_count": int(getattr(pl, "songnum", 0) or 0)}
                     for pl in playlists]
         try:
             items = await _qq_run(_fetch)

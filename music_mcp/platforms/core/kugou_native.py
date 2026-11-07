@@ -148,6 +148,23 @@ async def _throttle() -> None:
 # 路由实现（一条路由一个函数）
 # ---------------------------------------------------------------------------
 
+async def _user_history(cookie: dict[str, str], **params: Any) -> dict[str, Any]:
+    """听歌历史（最近播放）。上游模块：``user_history.js`` → ``/playhistory/v1/get_songs``。
+
+    注意：这条**不要**覆盖 ``x-router``。实测（2026-11-07）带上
+    ``x-router: history.service.kugou.com`` 或 ``cloudlist.service.kugou.com`` 都回 HTTP 404，
+    不带头走默认网关反而 status=1。``bp`` 是翻页游标（响应里给，下次原样带回来）。
+    """
+    userid = cookie.get("userid") or params.get("userid") or "0"
+    token = cookie.get("token") or ""
+    data: dict[str, Any] = {"token": token, "userid": userid,
+                            "source_classify": "app", "to_subdivide_sr": 1}
+    if params.get("bp"):
+        data["bp"] = params["bp"]
+    return await _send(base_url=GATEWAY, method="POST", url="/playhistory/v1/get_songs",
+                       encrypt_type="android", data=data, cookie=cookie)
+
+
 async def _login_qr_key(cookie: dict[str, str], **params: Any) -> dict[str, Any]:
     return await _send(
         base_url=LOGIN_USER, method="GET", url="/v2/qrcode", encrypt_type="web",
@@ -376,6 +393,7 @@ ROUTES: dict[str, Callable[..., Any]] = {
     "captcha_sent": _captcha_sent,
     "login_cellphone": _login_cellphone,
     "user_playlist": _user_playlist,
+    "user_history": _user_history,
     "playlist_track_all": _playlist_track_all,
     "playlist_track_all_new": _playlist_track_all_new,
     "everyday_recommend": _everyday_recommend,

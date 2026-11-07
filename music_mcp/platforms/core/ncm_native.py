@@ -314,6 +314,33 @@ class NcmNativeClient:
 
     # ---------------- data ----------------
 
+    async def play_records(self, uid: str, type_: int = 0,
+                           limit: int = 100) -> list[dict[str, Any]]:
+        """听歌排行（最近播放）。
+
+        ``type=0`` = 所有时间（``allData``）、``type=1`` = 最近一周（``weekData``）。
+        实测（2026-11-07）：type=0 有数据（「追光者」157 次），type=1 该账号为空 ——
+        两种都返回给上层，别把「这一周没听歌」当成「接口拿不到」。
+        """
+        data, _ = await self._request("/api/v1/play/record",
+                                      {"uid": str(uid), "type": type_, "limit": limit},
+                                      kind="weapi")
+        rows = data.get("allData" if type_ == 0 else "weekData") or []
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            song = row.get("song") or {}
+            name = str(song.get("name") or "")
+            if not name:
+                continue
+            artists = song.get("ar") or song.get("artists") or []
+            out.append({
+                "name": name,
+                "artist": str((artists[0] or {}).get("name") or "") if artists else "",
+                "play_count": int(row.get("playCount") or 0),
+                "id": str(song.get("id") or ""),
+            })
+        return out
+
     async def user_playlists(self, uid: str) -> list[dict[str, Any]]:
         payload, _ = await self._request("/api/user/playlist",
                                          {"uid": str(uid), "limit": 1000, "offset": 0,
