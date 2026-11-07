@@ -4,9 +4,19 @@
 `import MusicLibrary` 能过，但 ctypes 加载 `libengine.so` 必然失败（上游打包 bug，
 没有可换的新版）。所以「加密 + 请求」这套东西自己实现，零原生依赖、零容器。
 
-协议细节全在 ncm_crypto.py 里（逐字对照引擎内嵌 JS）。本文件负责的是**路由层**：
-哪条路由走哪个域名、用什么加密、参数怎么拼、Cookie 怎么带、响应怎么归一 —— 同样
-逐条对照引擎 bundle，不是照抄网上老版本的 Node 项目：
+协议底稿与跟版方式（2026-11-07 核实，别凭记忆改）：
+  * 底稿 = `pymusiclibrary` 自带 `ncm_music_api.dll` 里**明文内嵌的 JS**（webpack 压缩、未加密；
+    里面自带 package.json：`{"name":"NeteaseCloudMusicApi","version":"4.29.0"}`），即
+    api-enhanced（https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced ，MIT，
+    也就是 `moefurina/ncm-api` 镜像的上游）4.29 的打包产物。
+  * 跟版基准 = 上面那个仓库的 main 分支。已抽查 4.29 → 4.41.x 里本项目用到的路由，
+    参数与加密方式**没变**（cloudsearch/pc、user/playlist、playlist/create、
+    v3/discovery/recommend/songs 逐字一致）；差异只出现在它新增的接口上。
+  * 自检 = `NCM_LIVE=1 python tests/test_ncm_native.py`（真打上游）。哪天红了，
+    第一件事是照 api-enhanced 最新版对应模块改这里的路由/参数，不要凭记忆手改。
+
+本文件负责**路由层**：哪条路由走哪个域名、用什么加密、参数怎么拼、Cookie 怎么带、
+响应怎么归一；加密细节在 ncm_crypto.py（同样是逐字对照引擎内嵌 JS 得到的）。
 
     weapi → https://music.163.com/weapi/<uri 去掉 /api>
     eapi  → https://interface.music.163.com/eapi/<uri 去掉 /api>

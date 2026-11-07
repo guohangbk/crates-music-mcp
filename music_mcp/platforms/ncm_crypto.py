@@ -29,6 +29,9 @@ eapi（新接口，interface.music.163.com /eapi/...）::
 注意：weapi 里 secretKey **只反转一次**（引擎源码 `secretKey.split('').reverse().join('')`），
 反转后按 UTF-8 字节当大整数做裸 RSA（RSAES-PKCS1 都不要，就是 forge 的 `encrypt(str, 'NONE')`）。
 网上有些 Python 实现在这里反转两次，那样 encSecKey 是错的，登录一定失败。
+
+AES 本体（128/192/256、CBC/ECB、PKCS7）已抽到 `aes.py`，与酷狗共用；这里只保留
+网易云自己的常量与两种参数封装。
 """
 from __future__ import annotations
 
@@ -38,11 +41,19 @@ import json
 import secrets
 from typing import Any
 
+from . import aes as _aes
+
+# 兼容旧调用点：这几个名字历史上挂在 ncm_crypto 上（测试也在用）
+from .aes import SBOX, INV_SBOX  # noqa: F401
+from .aes import _gmul  # noqa: F401
+from .aes import pkcs7_pad as _pkcs7_pad  # noqa: F401
+from .aes import pkcs7_unpad as _pkcs7_unpad  # noqa: F401
+
 __all__ = [
     "PRESET_KEY", "IV", "EAPI_KEY", "PUBLIC_KEY_PEM",
     "aes_cbc_encrypt_b64", "aes_ecb_encrypt_hex",
     "aes_ecb_decrypt_hex", "aes_cbc_decrypt_b64",
-    "rsa_public_key", "rsa_encrypt_hex", "weapi", "eapi",
+    "rsa_public_key", "rsa_encrypt_hex", "weapi", "eapi", "eapi_decrypt_response",
 ]
 
 # --------------------------------------------------------------------------
@@ -61,190 +72,24 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDgtQn2JZ34ZC28NWYpAUd98iZ37BUrX/aKzmFbt7cl
 
 
 # --------------------------------------------------------------------------
-# AES-128：S 盒按 Rijndael 定义现场生成，避免手抄 256 字节抄错
+# AES：薄封装（本体在 aes.py，酷狗共用）
 # --------------------------------------------------------------------------
 
-def _rotl8(value: int, shift: int) -> int:
-    return ((value << shift) | (value >> (8 - shift))) & 0xff
-
-
-def _make_sbox() -> list[int]:
-    sbox = [0] * 256
-    p, q = 1, 1
-    while True:
-        p = p ^ ((p << 1) & 0xff) ^ (0x1b if p & 0x80 else 0)
-        q ^= (q << 1) & 0xff
-        q ^= (q << 2) & 0xff
-        q ^= (q << 4) & 0xff
-        if q & 0x80:
-            q ^= 0x09
-        sbox[p] = q ^ _rotl8(q, 1) ^ _rotl8(q, 2) ^ _rotl8(q, 3) ^ _rotl8(q, 4) ^ 0x63
-        if p == 1:
-            break
-    sbox[0] = 0x63
-    return sbox
-
-
-SBOX = _make_sbox()
-INV_SBOX = [0] * 256
-for _i, _v in enumerate(SBOX):
-    INV_SBOX[_v] = _i
-
-RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
-
-
-def _xtime(a: int) -> int:
-    a <<= 1
-    return (a ^ 0x1b) & 0xff if a & 0x100 else a
-
-
-def _gmul(a: int, b: int) -> int:
-    out = 0
-    for _ in range(8):
-        if b & 1:
-            out ^= a
-        a = _xtime(a)
-        b >>= 1
-    return out & 0xff
-
-
-def _expand_key(key: bytes) -> list[bytes]:
-    if len(key) != 16:
-        raise ValueError("AES-128 需要 16 字节密钥")
-    words = [key[4 * i:4 * i + 4] for i in range(4)]
-    for i in range(4, 44):
-        prev = words[i - 1]
-        if i % 4 == 0:
-            prev = bytes([SBOX[prev[1]] ^ RCON[i // 4 - 1], SBOX[prev[2]],
-                          SBOX[prev[3]], SBOX[prev[0]]])
-        words.append(bytes(a ^ b for a, b in zip(words[i - 4], prev)))
-    flat = b"".join(words)
-    return [flat[16 * r:16 * r + 16] for r in range(11)]
-
-
-def _add_round_key(state: list[int], rk: bytes) -> None:
-    for i in range(16):
-        state[i] ^= rk[i]
-
-
-def _shift_rows(state: list[int]) -> None:
-    # state 是列优先：第 r 行的下标是 r, r+4, r+8, r+12
-    for row in range(1, 4):
-        vals = [state[row + 4 * col] for col in range(4)]
-        vals = vals[row:] + vals[:row]
-        for col in range(4):
-            state[row + 4 * col] = vals[col]
-
-
-def _inv_shift_rows(state: list[int]) -> None:
-    for row in range(1, 4):
-        vals = [state[row + 4 * col] for col in range(4)]
-        vals = vals[-row:] + vals[:-row]
-        for col in range(4):
-            state[row + 4 * col] = vals[col]
-
-
-def _mix_columns(state: list[int]) -> None:
-    for col in range(4):
-        i = 4 * col
-        a0, a1, a2, a3 = state[i], state[i + 1], state[i + 2], state[i + 3]
-        state[i] = _xtime(a0) ^ (_xtime(a1) ^ a1) ^ a2 ^ a3
-        state[i + 1] = a0 ^ _xtime(a1) ^ (_xtime(a2) ^ a2) ^ a3
-        state[i + 2] = a0 ^ a1 ^ _xtime(a2) ^ (_xtime(a3) ^ a3)
-        state[i + 3] = (_xtime(a0) ^ a0) ^ a1 ^ a2 ^ _xtime(a3)
-
-
-def _inv_mix_columns(state: list[int]) -> None:
-    for col in range(4):
-        i = 4 * col
-        a0, a1, a2, a3 = state[i], state[i + 1], state[i + 2], state[i + 3]
-        state[i] = _gmul(a0, 14) ^ _gmul(a1, 11) ^ _gmul(a2, 13) ^ _gmul(a3, 9)
-        state[i + 1] = _gmul(a0, 9) ^ _gmul(a1, 14) ^ _gmul(a2, 11) ^ _gmul(a3, 13)
-        state[i + 2] = _gmul(a0, 13) ^ _gmul(a1, 9) ^ _gmul(a2, 14) ^ _gmul(a3, 11)
-        state[i + 3] = _gmul(a0, 11) ^ _gmul(a1, 13) ^ _gmul(a2, 9) ^ _gmul(a3, 14)
-
-
-def _encrypt_block(block: bytes, round_keys: list[bytes]) -> bytes:
-    state = list(block)
-    _add_round_key(state, round_keys[0])
-    for rnd in range(1, 10):
-        state = [SBOX[b] for b in state]
-        _shift_rows(state)
-        _mix_columns(state)
-        _add_round_key(state, round_keys[rnd])
-    state = [SBOX[b] for b in state]
-    _shift_rows(state)
-    _add_round_key(state, round_keys[10])
-    return bytes(state)
-
-
-def _decrypt_block(block: bytes, round_keys: list[bytes]) -> bytes:
-    state = list(block)
-    _add_round_key(state, round_keys[10])
-    for rnd in range(9, 0, -1):
-        _inv_shift_rows(state)
-        state = [INV_SBOX[b] for b in state]
-        _add_round_key(state, round_keys[rnd])
-        _inv_mix_columns(state)
-    _inv_shift_rows(state)
-    state = [INV_SBOX[b] for b in state]
-    _add_round_key(state, round_keys[0])
-    return bytes(state)
-
-
-def _pkcs7_pad(data: bytes) -> bytes:
-    pad = 16 - (len(data) % 16)
-    return data + bytes([pad]) * pad
-
-
-def _pkcs7_unpad(data: bytes) -> bytes:
-    if not data or len(data) % 16:
-        raise ValueError("不是合法的 PKCS7 密文长度")
-    pad = data[-1]
-    if not 1 <= pad <= 16 or data[-pad:] != bytes([pad]) * pad:
-        raise ValueError("PKCS7 填充校验失败")
-    return data[:-pad]
-
-
 def aes_ecb_encrypt(data: bytes, key: bytes = EAPI_KEY) -> bytes:
-    keys = _expand_key(key)
-    out = bytearray()
-    for off in range(0, len(data), 16):
-        out += _encrypt_block(data[off:off + 16], keys)
-    return bytes(out)
+    return _aes.aes_ecb_encrypt(data, key)
 
 
 def aes_ecb_decrypt(data: bytes, key: bytes = EAPI_KEY) -> bytes:
-    keys = _expand_key(key)
-    out = bytearray()
-    for off in range(0, len(data), 16):
-        out += _decrypt_block(data[off:off + 16], keys)
-    return bytes(out)
+    return _aes.aes_ecb_decrypt(data, key)
 
 
 def aes_cbc_encrypt(data: bytes, key: bytes, iv: bytes = IV) -> bytes:
-    keys = _expand_key(key)
-    prev, out = iv, bytearray()
-    for off in range(0, len(data), 16):
-        block = bytes(a ^ b for a, b in zip(data[off:off + 16], prev))
-        prev = _encrypt_block(block, keys)
-        out += prev
-    return bytes(out)
+    return _aes.aes_cbc_encrypt(data, key, iv)
 
 
 def aes_cbc_decrypt(data: bytes, key: bytes, iv: bytes = IV) -> bytes:
-    keys = _expand_key(key)
-    prev, out = iv, bytearray()
-    for off in range(0, len(data), 16):
-        block = data[off:off + 16]
-        out += bytes(a ^ b for a, b in zip(_decrypt_block(block, keys), prev))
-        prev = block
-    return bytes(out)
+    return _aes.aes_cbc_decrypt(data, key, iv)
 
-
-# --------------------------------------------------------------------------
-# 对外：三种输出格式（都和 CryptoJS 的对齐）
-# --------------------------------------------------------------------------
 
 def aes_cbc_encrypt_b64(text: str | bytes, key: bytes, iv: bytes = IV) -> str:
     raw = text.encode("utf-8") if isinstance(text, str) else text
