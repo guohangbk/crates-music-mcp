@@ -211,22 +211,23 @@ async def _playlist_tracks(cookie: str, listid: str = "", collection_id: str = "
 class KugouPlatform(MusicPlatform):
     key = Platform.KUGOU
     label = "酷狗音乐"
-    default_method = "qr"
+    default_method = "phone_code"
 
     def status(self) -> dict[str, Any]:
         return vault.status()["kugou"]
 
     def auth_hint(self) -> str:
-        return ("酷狗未登录：login_start(service='kugou', method='qr'|'phone_code', phone='...')，"
-                "扫码走 login_poll，短信走 login_submit。")
+        return ("酷狗未登录：login_start(service='kugou', method='phone_code', phone='...')，"
+                "收到验证码后 login_submit；也可以 method='qr' 扫码。")
 
     def login_methods(self) -> list[dict[str, str]]:
         return [
-            {"method": "qr", "label": "酷狗 App 扫码（推荐）",
+            {"method": "phone_code", "label": "手机验证码（推荐）",
+             "account": "手机号对应的酷狗账号", "needs": "phone + 短信验证码",
+             "note": "无二维码、不用截图；若撞上风控（要求安全验证）就改用 qr"},
+            {"method": "qr", "label": "酷狗 App 扫码",
              "account": "酷狗音乐 App 当前登录的账号", "needs": "酷狗音乐 App 扫一扫",
-             "note": f"至少 8 分钟有效（实测），过期就重新 login_start"},
-            {"method": "phone_code", "label": "手机验证码",
-             "account": "手机号对应的酷狗账号", "needs": "phone + 短信验证码", "note": "无需二维码"},
+             "note": "至少 8 分钟有效（实测），过期就重新 login_start"},
         ]
 
     def scan_hint(self, method: str) -> str:

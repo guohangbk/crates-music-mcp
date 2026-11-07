@@ -398,7 +398,7 @@ class NeteasePlatform(MusicPlatform):
 
     key = Platform.NETEASE
     label = "网易云音乐"
-    default_method = "cookie"
+    default_method = "phone_code"
 
     # ---------------- 凭证 ----------------
 
@@ -421,11 +421,12 @@ class NeteasePlatform(MusicPlatform):
 
     def login_methods(self) -> list[dict[str, str]]:
         return [
-            {"method": "cookie", "label": "直接导入 Cookie（推荐）",
+            {"method": "phone_code", "label": "手机验证码（推荐）",
+             "account": "手机号对应的网易云账号", "needs": "phone + 短信验证码",
+             "note": "无需二维码、不用截图，跨设备最稳"},
+            {"method": "cookie", "label": "直接导入 Cookie",
              "account": "Cookie 对应的网易云账号", "needs": "MUSIC_U=...; __csrf=...",
-             "note": "用 credential_set_cookie，无需扫码/验证码"},
-            {"method": "phone_code", "label": "手机验证码",
-             "account": "手机号对应的网易云账号", "needs": "phone + 短信验证码", "note": "无需二维码"},
+             "note": "用 credential_set_cookie；浏览器已登录时复制一段请求头即可"},
             {"method": "qr", "label": "网易云 App 扫码",
              "account": "App 当前登录账号", "needs": "网易云 App 扫一扫",
              "note": f"约 {NCM_QR_TTL} 秒有效（2026-11-07 实测：291 秒仍可用、306 秒已过期）"},

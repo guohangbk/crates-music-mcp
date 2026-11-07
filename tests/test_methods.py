@@ -100,6 +100,7 @@ print("netease configured:", st.get("netease", {}).get("configured"))
 
 assert {m["method"] for m in qq["methods"]} == {"phone_code", "qq_qr", "wx_qr", "mobile_qr"}
 assert qq["default"] == "phone_code"
-assert ncm["default"] == "cookie"
+# 三平台都默认手机验证码：纯文本、不用截图扫码（cookie / qr 仍作为备选保留）
+assert ncm["default"] == "phone_code"
 assert imp["ok"] and st["netease"]["configured"]
 print("PASS: methods + cookie import")
