@@ -11,19 +11,85 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import importlib
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
-
-from qqmusic_api import Client, Credential
-from qqmusic_api.models.login import PhoneLoginEvents, QR, QRCodeLoginEvents, QRLoginType
-from qqmusic_api.modules.login_utils import PhoneLoginSession
-from qqmusic_api.modules.search import SearchType
 
 from .. import vault
 from .core.base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
                    Platform, Song, dedupe, name_matches, normalize)
+
+if TYPE_CHECKING:                     # 只给编辑器 / 类型检查看，运行时不导入
+    from qqmusic_api import Client, Credential
+    from qqmusic_api.models.login import PhoneLoginEvents, QR, QRCodeLoginEvents, QRLoginType
+    from qqmusic_api.modules.login_utils import PhoneLoginSession
+    from qqmusic_api.modules.search import SearchType
+
+# ---------------------------------------------------------------------------
+# qqmusic_api 懒加载
+#
+# 为什么要这么绕：`import qqmusic_api` 自己约 **0.65 秒**（进程内 -X importtime 实测），
+# 而 platforms/qq.py 是四个 MCP 入口都会导入的模块 —— MCP 客户端每次 spawn 进程都要付一次，
+# 哪怕这次会话只用网易云/酷狗。
+#
+# 做法：模块级名字换成"延迟代理"。第一次真正用到时才 import，**调用点一行都不用改**：
+#     Client(credential=...)          -> 代理 __call__ 转发
+#     SearchType.SONG / QRCodeLoginEvents.SCAN -> 代理 __getattr__ 转发
+#     Credential.model_validate(...)  -> 同上
+# 代价是这里多个代理类；收益是 QQ 相关 0 处调用点改动。
+# ---------------------------------------------------------------------------
+
+_LAZY_SOURCES: dict[str, tuple[str, str]] = {
+    "Client": ("qqmusic_api", "Client"),
+    "Credential": ("qqmusic_api", "Credential"),
+    "SearchType": ("qqmusic_api.modules.search", "SearchType"),
+    "QRLoginType": ("qqmusic_api.models.login", "QRLoginType"),
+    "QR": ("qqmusic_api.models.login", "QR"),
+    "QRCodeLoginEvents": ("qqmusic_api.models.login", "QRCodeLoginEvents"),
+    "PhoneLoginEvents": ("qqmusic_api.models.login", "PhoneLoginEvents"),
+    "PhoneLoginSession": ("qqmusic_api.modules.login_utils", "PhoneLoginSession"),
+}
+_RESOLVED: dict[str, Any] = {}
+
+
+def _resolve(name: str) -> Any:
+    if name not in _RESOLVED:
+        module_name, attr = _LAZY_SOURCES[name]
+        _RESOLVED[name] = getattr(importlib.import_module(module_name), attr)
+    return _RESOLVED[name]
+
+
+class _LazyName:
+    """延迟解析的模块级名字（用一次就缓存）。"""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def _target(self) -> Any:
+        return _resolve(self._name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._target()(*args, **kwargs)
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._target(), item)
+
+    def __repr__(self) -> str:
+        return f"<lazy qqmusic_api.{self._name}>"
+
+
+Client = _LazyName("Client")
+Credential = _LazyName("Credential")
+SearchType = _LazyName("SearchType")
+QRLoginType = _LazyName("QRLoginType")
+QR = _LazyName("QR")
+QRCodeLoginEvents = _LazyName("QRCodeLoginEvents")
+PhoneLoginEvents = _LazyName("PhoneLoginEvents")
+PhoneLoginSession = _LazyName("PhoneLoginSession")
 
 _norm = normalize  # 旧代码里的名字
 
@@ -53,12 +119,17 @@ QR_HINTS = {
 # 注意库的语义（models/login.py）：SCAN=66 是「**还没扫**，等待扫描」，CONF=67 才是
 # 「已扫，等待确认」。2026-11-07 实测：没人扫的码连poll 三次全是 SCAN —— 所以这里
 # 以前把 SCAN 说成「已扫码，请点确认」是错的，会让 agent 误报进度、催用户点一个还没出现的确认。
-QR_EVENT_STATUS = {
-    QRCodeLoginEvents.SCAN: ("waiting", "二维码已就绪，等待扫码"),
-    QRCodeLoginEvents.CONF: ("scanned", "已扫码，请在手机上点「确认登录」"),
-    QRCodeLoginEvents.TIMEOUT: ("expired", "二维码已过期，请重新 login_start"),
-    QRCodeLoginEvents.REFUSE: ("failed", "QQ 返回 68：二维码失效或被取消。常见原因是扫了过期/被新码顶替的旧码，或在手机上点了取消。请重新 login_start 再扫一次。"),
-}
+#
+# 写成函数而不是模块级字典：字典的 key 是 QRCodeLoginEvents 的枚举成员，模块级求值
+# 就会把 qqmusic_api 拉起来（0.65s），懒加载就白做了。
+def qr_event_status(event: Any) -> tuple[str, str]:
+    mapping = {
+        QRCodeLoginEvents.SCAN: ("waiting", "二维码已就绪，等待扫码"),
+        QRCodeLoginEvents.CONF: ("scanned", "已扫码，请在手机上点「确认登录」"),
+        QRCodeLoginEvents.TIMEOUT: ("expired", "二维码已过期，请重新 login_start"),
+        QRCodeLoginEvents.REFUSE: ("failed", "QQ 返回 68：二维码失效或被取消。常见原因是扫了过期/被新码顶替的旧码，或在手机上点了取消。请重新 login_start 再扫一次。"),
+    }
+    return mapping.get(event, ("failed", f"二维码登录失败: {getattr(event, 'name', event)}"))
 
 # mobile_qr 走 MQTT 推送：流一连上库就先 yield 一个 SCAN（表示「已就绪」），
 # 真正的扫码是 CONF。所以这条路上 SCAN 要按「等待扫码」讲，不能照搬 qq_qr 的文案。
@@ -132,8 +203,7 @@ async def _poll_mobile_qr(ticket: LoginTicket) -> LoginState:
     if item.event == QRCodeLoginEvents.SCAN:
         status, message = MOBILE_QR_SCAN_STATUS
     else:
-        status, message = QR_EVENT_STATUS.get(
-            item.event, ("failed", f"二维码登录失败: {getattr(item.event, 'name', item.event)}"))
+        status, message = qr_event_status(item.event)
     if status in {"expired", "failed"}:
         await _close_handle(handle)
         ticket.handle = None
@@ -549,8 +619,7 @@ class QQMusicPlatform(MusicPlatform):
             ticket.handle = None
             return LoginState(ok=True, status="succeeded",
                               message="QQ 音乐登录成功，完整 Credential 已写入共享凭证库")
-        status, message = QR_EVENT_STATUS.get(
-            result.event, ("failed", f"二维码登录失败: {getattr(result.event, 'name', result.event)}"))
+        status, message = qr_event_status(result.event)
         if status in {"expired", "failed"}:
             await _close_handle(ticket.handle)
             ticket.handle = None

@@ -54,9 +54,13 @@ def _start(name: str, transport: str, port: int) -> None:
     mcp = build_server(name)
     if transport == "stdio":
         mcp.run(transport="stdio")
-    else:
-        app = mcp.streamable_http_app()
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        return
+    # uvicorn 只在 http 传输时才导入：它自己约 175ms（进程内 importtime 实测），
+    # 而 stdio 是绝大多数用法 —— MCP 客户端每次 spawn 进程都要付一次这个导入成本。
+    import uvicorn
+
+    app = mcp.streamable_http_app()
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
 def main() -> None:
