@@ -22,7 +22,7 @@ from qqmusic_api.modules.login_utils import PhoneLoginSession
 from qqmusic_api.modules.search import SearchType
 
 from .. import vault
-from .base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
+from .core.base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
                    Platform, Song, dedupe, name_matches, normalize)
 
 _norm = normalize  # 旧代码里的名字

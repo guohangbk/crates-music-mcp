@@ -5,11 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "crates-music-mcp"
 version = "0.1.0"
-description = "Music MCP servers: QQ Music + NetEase auth, profile analysis, playlist creation"
+description = "把你三个音乐 App（网易云 / QQ 音乐 / 酷狗）的收藏交给 Agent，让它每天替你挑一张对味的歌单"
+keywords = ["mcp", "model-context-protocol", "netease", "qqmusic", "kugou", "playlist", "music"]
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name = "crates"}]
+authors = [{name = "crates-music-mcp"}]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
 dependencies = [
     "mcp>=1.10,<2",
     "uvicorn>=0.30",
@@ -32,8 +38,9 @@ crates-profile = "music_mcp.app:main_profile"
 crates-playlist = "music_mcp.app:main_playlist"
 
 [tool.setuptools]
-# 别忘了子包：漏了 platforms 打出来的轮子会缺整个平台层
-packages = ["music_mcp", "music_mcp.platforms"]
+# 别忘了子包：漏了 platforms / platforms.core 打出来的轮子会缺整个协议层
+packages = ["music_mcp", "music_mcp.platforms", "music_mcp.platforms.core"]
+license-files = ["LICENSE"]
 
 [tool.setuptools.package-data]
 music_mcp = ["*.md"]

@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from music_mcp.platforms import ncm_crypto as C  # noqa: E402
+from music_mcp.platforms.core import ncm_crypto as C  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -130,7 +130,7 @@ def test_eapi_shape() -> None:
 
 
 async def live_smoke() -> None:
-    from music_mcp.platforms.ncm_native import NcmNativeClient
+    from music_mcp.platforms.core.ncm_native import NcmNativeClient
 
     client = NcmNativeClient()
     songs = await client.cloud_search("晴天 周杰伦", limit=3)

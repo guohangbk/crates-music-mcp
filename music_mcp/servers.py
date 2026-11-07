@@ -25,7 +25,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from . import compose, login, qr, vault
 from .login import LOGIN_USAGE, login_sessions
 from .platforms import DEFAULT_ORDER, all_platforms, get_platform, resolve_keys
-from .platforms.base import Platform, Song, platform_of
+from .platforms.core.base import Platform, Song, platform_of
 
 
 def _dump(payload: dict[str, Any]) -> str:

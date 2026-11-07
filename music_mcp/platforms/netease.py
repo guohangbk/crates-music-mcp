@@ -22,9 +22,9 @@ from typing import Any
 import httpx
 
 from .. import vault
-from .base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
+from .core.base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
                    Platform, Song, dedupe, name_matches, normalize, song_key)
-from .ncm_native import NcmNativeClient
+from .core.ncm_native import NcmNativeClient
 
 _norm = normalize  # 旧代码里的名字
 

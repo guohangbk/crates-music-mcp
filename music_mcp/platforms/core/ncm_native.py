@@ -76,9 +76,9 @@ def _rand_hex(nbytes: int) -> str:
     return secrets.token_hex(nbytes)
 
 
-# 常量放在这里而不是模块顶部 import，是为了避开与 netease.py 的循环导入
+# 常量放在这里而不是模块顶部 import，是为了避开与上一层 netease.py 的循环导入
 def _shared():
-    from . import netease
+    from .. import netease
 
     return netease
 
@@ -281,7 +281,7 @@ class NcmNativeClient:
 
     async def qr_create(self, key: str) -> str:
         """二维码内容上游只是固定格式的链接，本地渲染成 data URL。"""
-        from ..qr import data_url
+        from ...qr import data_url
 
         return data_url(f"{self.domain}/login?codekey={key}") if key else ""
 

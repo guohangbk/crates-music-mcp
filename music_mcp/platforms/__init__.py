@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
+from .core.base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
                    Platform, Song, dedupe, key_of, normalize, platform_of, song_key)
 from .kugou import KugouPlatform
 from .netease import NeteasePlatform

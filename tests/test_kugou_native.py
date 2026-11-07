@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from music_mcp.platforms import kugou_crypto as C  # noqa: E402
+from music_mcp.platforms.core import kugou_crypto as C  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -115,7 +115,7 @@ def test_device_identity() -> None:
 
 async def live() -> None:
     from music_mcp import vault
-    from music_mcp.platforms import kugou_native
+    from music_mcp.platforms.core import kugou_native
 
     body = await kugou_native.call("search", keywords="晴天 周杰伦", page=1, pagesize=3)
     items = (body.get("data") or {}).get("lists") or []
