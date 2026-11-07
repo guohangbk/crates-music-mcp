@@ -24,7 +24,7 @@ from mcp.server.fastmcp import FastMCP, Image
 
 from . import compose, login, qr, vault
 from .login import LOGIN_USAGE, login_sessions
-from .platforms import DEFAULT_ORDER, get_platform, resolve_keys
+from .platforms import DEFAULT_ORDER, all_platforms, get_platform, resolve_keys
 from .platforms.base import Platform, Song, platform_of
 
 
@@ -195,8 +195,21 @@ def build_server(name: str) -> FastMCP:
 
         @mcp.tool()
         async def credential_status() -> str:
-            """Check every platform's credential status (qq_music / netease / kugou)."""
-            return _dump(vault.status())
+            """Check every platform's credential status (qq_music / netease / kugou).
+
+            除 vault 里的存档信息外，还会让平台自己补全「要问一次上游才知道」的字段
+            （例如网易云的 uid —— Cookie 导入时没有，不能一直显示成空）。
+            """
+            payload = vault.status()
+            for key, platform in all_platforms().items():
+                entry = payload.get(key.value)
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    payload[key.value] = await platform.enrich_status(entry)
+                except Exception as exc:  # noqa: BLE001 - 补信息失败不影响主状态
+                    entry["enrich_error"] = f"{exc.__class__.__name__}: {exc}"
+            return _dump(payload)
 
         @mcp.tool()
         async def credential_refresh(service: Platform = Platform.QQ_MUSIC) -> str:

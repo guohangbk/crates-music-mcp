@@ -70,6 +70,23 @@ login_submit(session_id=..., code="123456")
 
 凭证**自动刷新**：QQ 到期前 6 小时按需刷新，网易云距上次续期超 12 小时主动调 `/login/refresh`。跨进程 `flock` 互斥，保证不会同时刷新。
 
+### 登录会话：有效期按真实值上报，跨进程可续
+
+- `login_start` 返回的 `expires_in_seconds` 是**该平台二维码的真实寿命**，不是一刀切的会话 TTL
+  （另有 `session_ttl_seconds` 表示我们最多留多久）：
+
+  | 方式 | 实测有效期 | 依据 |
+  | --- | --- | --- |
+  | 网易云 `qr` | 300 s | 2026-11-07 实测：291 s 仍回 801、306 s 回 800 |
+  | QQ `qq_qr` / `wx_qr` | 120 s | 实测：114 s 仍回 SCAN、131 s 回 TIMEOUT |
+  | QQ `mobile_qr` | 300 s（MQTT 监听窗口） | 走推送，没有可询的 HTTP 状态 |
+  | 酷狗 `qr` | ≥480 s（实测 8 分钟仍可用） | 没等到过期点，上报按会话窗口 600 s |
+
+- **会话落盘**（`state/login_sessions.json`）：票据是纯数据的那些（网易云/酷狗的 `unikey`、
+  QQ 的 `qrsig`、验证码登录的 `phone`）会被持久化，MCP 进程重启后 `login_poll` 照样能续。
+  QQ `mobile_qr` 例外 —— 它的登录结果由 MQTT 推送带回来，错过就没了，所以必须在当前进程里完成。
+
+
 ## 生成歌单
 
 ```

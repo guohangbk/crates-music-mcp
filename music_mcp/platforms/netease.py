@@ -13,6 +13,7 @@ tracks）；上游 405「操作频繁」要退避重试，搜索这类接口尤�
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
@@ -28,6 +29,9 @@ from .ncm_native import NcmNativeClient
 _norm = normalize  # 旧代码里的名字
 
 NCM_LIKED = "喜欢的音乐"
+# 扫码登录那个 unikey 的真实寿命（秒）。2026-11-07 实测：第 291 秒仍回 801（等待扫码），
+# 第 306 秒回 800（二维码不存在或已过期）→ 取 300。以前这里写 180、会话却报 600，两个都不对。
+NCM_QR_TTL = 300
 NCM_AUTH_HINT = ("网易云未登录或 Cookie 已失效：优先 credential_set_cookie(service='netease', "
                  "value='MUSIC_U=...; __csrf=...')，或 login_start(service='netease', "
                  "method='phone_code'|'qr') 走短信/扫码。")
@@ -180,6 +184,30 @@ def make_ncm_client(cookie: str = "", base: str | None = None) -> NcmNativeClien
     return NcmNativeClient(cookie=cookie, base=base)
 
 
+async def ncm_ensure_uid(timeout: float = 10.0) -> str:
+    """把账号 uid 补进 vault。
+
+    为什么需要：`credential_set_cookie` 导入时通常只给 Cookie（没有 uid），于是
+    `credential_status` 里 netease.uid 永远是空 —— 而 QQ 那边有 musicid，看起来就像
+    网易云"没登录成功"。有效 MUSIC_U 一问 `/login/status` 就有 uid，问一次落库即可。
+    """
+    cookie = vault.ncm_cookie()
+    if not vault.ncm_cookie_is_valid(cookie):
+        return ""
+    uid = str(vault.get_ncm().get("uid") or "")
+    if uid:
+        return uid
+    try:
+        status = await asyncio.wait_for(make_ncm_client(cookie=cookie).login_status(), timeout)
+    except Exception:  # noqa: BLE001 - 补信息失败不该让调用方出错（离线/限流都算）
+        return ""
+    account = (status.get("data") or {}).get("account") or {}
+    uid = str(account.get("id") or "")
+    if uid:
+        vault.set_ncm(cookie, {"uid": uid})
+    return uid
+
+
 async def ncm_credential(*, force: bool = False) -> str:
     with vault.vault_lock():
         cookie = vault.ncm_cookie()
@@ -191,7 +219,11 @@ async def ncm_credential(*, force: bool = False) -> str:
             if vault.ncm_cookie_is_valid(new_cookie):
                 cookie = vault.merge_cookie(cookie, new_cookie)
                 vault.set_ncm(cookie)
-        return cookie
+    # 顺手把缺失的 uid 补上（不占锁，失败无所谓）：任何取数路径走过一次，
+    # credential_status 之后就能像 QQ 一样显示账号。
+    if not vault.get_ncm().get("uid"):
+        await ncm_ensure_uid()
+    return cookie
 
 async def _ncm_run(operation):
     cookie = await ncm_credential()
@@ -375,6 +407,15 @@ class NeteasePlatform(MusicPlatform):
         # 时能一眼看到用的不是容器/引擎，省得去猜部署形态。
         return {**vault.status()["netease"], "backend": "native"}
 
+    async def enrich_status(self, status: dict[str, Any]) -> dict[str, Any]:
+        """把 uid 补上再报出去（Cookie 导入时没有 uid，得问一次上游；见 ncm_ensure_uid）。"""
+        out = {**status, "backend": "native"}
+        if not out.get("uid"):
+            uid = await ncm_ensure_uid()
+            if uid:
+                out["uid"] = uid
+        return out
+
     def auth_hint(self) -> str:
         return NCM_AUTH_HINT
 
@@ -386,7 +427,8 @@ class NeteasePlatform(MusicPlatform):
             {"method": "phone_code", "label": "手机验证码",
              "account": "手机号对应的网易云账号", "needs": "phone + 短信验证码", "note": "无需二维码"},
             {"method": "qr", "label": "网易云 App 扫码",
-             "account": "App 当前登录账号", "needs": "网易云 App 扫一扫", "note": "180 秒有效"},
+             "account": "App 当前登录账号", "needs": "网易云 App 扫一扫",
+             "note": f"约 {NCM_QR_TTL} 秒有效（2026-11-07 实测：291 秒仍可用、306 秒已过期）"},
         ]
 
     def scan_hint(self, method: str) -> str:
@@ -415,8 +457,9 @@ class NeteasePlatform(MusicPlatform):
             payload = await client.captcha_sent(phone, ctcode)
             if int(payload.get("code") or 0) != 200:
                 return LoginStart(ok=False, status="failed", error=f"发送验证码失败: {payload}")
+            # 票据只有手机号，submit 时现开 client —— 进程重启后照样能提交验证码
             return LoginStart(ok=True, status="awaiting_code",
-                              ticket=LoginTicket({"phone": phone, "ctcode": ctcode}),
+                              ticket=LoginTicket({"phone": phone, "ctcode": ctcode}, None, True),
                               message=f"验证码已发送到 {phone}")
         if method != "qr":
             return LoginStart(ok=False, status="failed", error=f"不支持的登录方式: {method}")
@@ -424,8 +467,11 @@ class NeteasePlatform(MusicPlatform):
         if not key:
             return LoginStart(ok=False, status="failed", error="获取二维码 key 失败")
         qrimg = await client.qr_create(key)
-        return LoginStart(ok=True, status="waiting", ticket=LoginTicket({"unikey": key}),
-                          qr_image=qrimg, message="二维码已作为图片一并返回。扫码后调用 login_poll。")
+        # 票据只有 unikey（poll 时现开 client 查状态）→ 可落盘、可跨进程续
+        return LoginStart(ok=True, status="waiting",
+                          ticket=LoginTicket({"unikey": key}, None, True),
+                          qr_image=qrimg, expires_in=NCM_QR_TTL,
+                          message="二维码已作为图片一并返回。扫码后调用 login_poll。")
 
     async def login_poll(self, ticket: LoginTicket) -> LoginState:
         code, message, payload, response = await make_ncm_client().qr_check(

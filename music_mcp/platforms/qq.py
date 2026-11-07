@@ -17,7 +17,7 @@ from typing import Any
 import anyio
 
 from qqmusic_api import Client, Credential
-from qqmusic_api.models.login import PhoneLoginEvents, QRCodeLoginEvents, QRLoginType
+from qqmusic_api.models.login import PhoneLoginEvents, QR, QRCodeLoginEvents, QRLoginType
 from qqmusic_api.modules.login_utils import PhoneLoginSession
 from qqmusic_api.modules.search import SearchType
 
@@ -34,6 +34,9 @@ EXPIRED_CODES = {1000, 2001, 104400, 104401}
 REC_PLAYLIST_LIMIT = 3      # 最多解析几个推荐歌单
 REC_PLAYLIST_TRACKS = 50    # 每个推荐歌单最多取多少首
 MOBILE_POLL_WAIT = 8        # mobile_qr 单次 poll 最多等多久（外层 login.py 限 12 秒，别超）
+MOBILE_QR_TTL = 300         # mobile_qr 的 MQTT 监听窗口（手机客户端二维码走推送，没有 HTTP 查询）
+QQ_QR_TTL = 120             # qq_qr / wx_qr 有效期。2026-11-07 实测：114 秒仍回 SCAN（等待扫码）、
+                            # 131 秒回 TIMEOUT → 取 120（上游声明值是 ptqrshow 的 2 分钟）
 
 QR_HINTS = {
     "qq_qr": "必须用【手机 QQ 的扫一扫】扫这个码（微信、系统相机、QQ 音乐 App 都不行，会打开网页跳到 QQ 首页）。扫码后 QQ 会弹出「QQ音乐登录确认」，点确认，再调用 login_poll。",
@@ -44,11 +47,14 @@ QR_HINTS = {
 
 
 # 二维码登录的事件 -> (对外状态, 给用户看的话)。qq_qr / wx_qr / mobile_qr 共用。
+# 注意库的语义（models/login.py）：SCAN=66 是「**还没扫**，等待扫描」，CONF=67 才是
+# 「已扫，等待确认」。2026-11-07 实测：没人扫的码连poll 三次全是 SCAN —— 所以这里
+# 以前把 SCAN 说成「已扫码，请点确认」是错的，会让 agent 误报进度、催用户点一个还没出现的确认。
 QR_EVENT_STATUS = {
-    QRCodeLoginEvents.SCAN: ("scanned", "已扫码，请在手机上点确认"),
-    QRCodeLoginEvents.CONF: ("confirming", "登录确认中，请稍候再 poll"),
+    QRCodeLoginEvents.SCAN: ("waiting", "二维码已就绪，等待扫码"),
+    QRCodeLoginEvents.CONF: ("scanned", "已扫码，请在手机上点「确认登录」"),
     QRCodeLoginEvents.TIMEOUT: ("expired", "二维码已过期，请重新 login_start"),
-    QRCodeLoginEvents.REFUSE: ("failed", "QQ 返回 68：二维码失效或被取消。常见原因是扫了过期/被新码顶替的旧码，或在手机上点了取消。请重新 login_start，180 秒内用手机 QQ 扫一扫。"),
+    QRCodeLoginEvents.REFUSE: ("failed", "QQ 返回 68：二维码失效或被取消。常见原因是扫了过期/被新码顶替的旧码，或在手机上点了取消。请重新 login_start 再扫一次。"),
 }
 
 # mobile_qr 走 MQTT 推送：流一连上库就先 yield 一个 SCAN（表示「已就绪」），
@@ -445,7 +451,7 @@ class QQMusicPlatform(MusicPlatform):
             if result.event == PhoneLoginEvents.FREQUENCY:
                 return LoginStart(ok=False, status="failed", error="发送过于频繁，请稍后再试")
             return LoginStart(ok=True, status="awaiting_code",
-                              ticket=LoginTicket({"phone": phone, "ctcode": ctcode}),
+                              ticket=LoginTicket({"phone": phone, "ctcode": ctcode}, None, True),
                               message=f"验证码已发送到 {phone[-4:].rjust(len(phone), '*')}")
 
         login_type = {"qq_qr": QRLoginType.QQ, "wx_qr": QRLoginType.WX,
@@ -459,31 +465,54 @@ class QQMusicPlatform(MusicPlatform):
         except Exception:
             await _close_handle({"client": client})
             raise
-        # 把 live Client 与 QR 对象放进票据：qq_qr / wx_qr 的 check_qrcode 是每次现查的，
-        # 可预测；不用 flow.iter_events()（那个生成器自己 sleep + 去重，手动 __anext__ 会卡满 180s）。
         image = (f"data:{qr.mimetype or 'image/png'};base64,"
                  + base64.b64encode(qr.data or b"").decode())
-        handle: dict[str, Any] = {"client": client, "qr": qr}
+
         if login_type == QRLoginType.MOBILE:
-            # 手机客户端二维码只能用 MQTT 推送查状态（见 _mobile_qr_worker），
-            # 起个后台任务把事件搬进队列，login_poll 每次取一条。
+            # 手机客户端的二维码只能用 MQTT 推送查状态，而且推送**错过就没了**，
+            # 所以这条必须常驻连接 + 后台任务，票据也就没法跨进程续。
+            handle: dict[str, Any] = {"client": client, "qr": qr}
             queue: asyncio.Queue[Any] = asyncio.Queue()
             handle["queue"] = queue
             handle["task"] = asyncio.create_task(
-                _mobile_qr_worker(client, qr, queue, anyio.current_time() + 300))
+                _mobile_qr_worker(client, qr, queue, anyio.current_time() + MOBILE_QR_TTL))
+            return LoginStart(ok=True, status="waiting",
+                              ticket=LoginTicket({"method": method}, handle),
+                              qr_image=image, expires_in=MOBILE_QR_TTL,
+                              message="二维码已作为图片一并返回。扫码后调用 login_poll。")
+
+        # qq_qr / wx_qr：状态查询是一次普通 HTTP GET（qrsig / uuid + 一次请求），
+        # 不需要常驻 client —— 所以拿完码就断开，票据里只留标识符。
+        # 好处：进程重启后还能接着 poll（登录会话会落盘，见 login.py）。
+        await _close_handle({"client": client})
         return LoginStart(ok=True, status="waiting",
-                          ticket=LoginTicket({"method": method}, handle),
-                          qr_image=image, message="二维码已作为图片一并返回。扫码后调用 login_poll。")
+                          ticket=LoginTicket({"method": method, "qr_type": login_type.value,
+                                              "identifier": qr.identifier}, None, True),
+                          qr_image=image, expires_in=QQ_QR_TTL,
+                          message="二维码已作为图片一并返回。扫码后调用 login_poll。")
+
+    @staticmethod
+    async def _check_stateless(ticket: LoginTicket) -> Any:
+        """用新鲜 Client + 票据里的标识符查一次状态（无常驻句柄）。"""
+        qr_type = QRLoginType(str(ticket.payload.get("qr_type") or QRLoginType.QQ.value))
+        stale = QR(b"", qr_type, "image/png", str(ticket.payload.get("identifier") or ""))
+        async with Client() as client:
+            return await client.login.check_qrcode(stale)
 
     async def login_poll(self, ticket: LoginTicket) -> LoginState:
         handle = ticket.handle or {}
         if handle.get("queue") is not None:
             return await _poll_mobile_qr(ticket)
-        client, qr = handle.get("client"), handle.get("qr")
-        if client is None or qr is None:
-            return LoginState(ok=False, status="expired", error="登录会话已失效，请重新 login_start")
         try:
-            result = await client.login.check_qrcode(qr)
+            if ticket.payload.get("identifier"):
+                result = await self._check_stateless(ticket)
+            else:
+                # 兼容老票据（进程内旧会话）：还攥着 live client 的那种
+                client, qr = handle.get("client"), handle.get("qr")
+                if client is None or qr is None:
+                    return LoginState(ok=False, status="expired",
+                                      error="登录会话已失效，请重新 login_start")
+                result = await client.login.check_qrcode(qr)
         except Exception as exc:
             # qqmusic-api-python 在解析不了 QQ 的 ptqrlogin 响应时会抛 ApiDataError。
             # 这是上游解析问题，不是用户拒登 —— 要如实说清楚。

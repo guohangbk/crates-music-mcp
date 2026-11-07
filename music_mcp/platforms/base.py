@@ -97,12 +97,16 @@ class CreateResult:
 class LoginTicket:
     """一次待完成登录的全部中间状态。
 
-    只有对应平台看得懂，外层只负责按 session_id 存着再交回去。QQ 的票据里还要攥着
-    一个 live Client + 二维码对象（没法序列化，所以登录会话只能活在一个进程里）。
+    只有对应平台看得懂，外层只负责按 session_id 存着再交回去。
+
+    `resumable=True` 表示 `payload` 是**纯数据**（例如 {unikey} / {qrsig} / {phone,ctcode}），
+    平台可以只靠它重新查状态 —— 这种票据会被持久化，进程重启后还能接着 poll。
+    `handle` 里如果攥着 live 对象（QQ mobile_qr 的 MQTT 连接就是），就只能在当前进程里用。
     """
 
     payload: dict[str, Any] = field(default_factory=dict)
     handle: Any = None
+    resumable: bool = False
 
 @dataclass
 class LoginStart:
@@ -112,6 +116,7 @@ class LoginStart:
     qr_image: str = ""                 # data URL：二维码图片（外层负责投递）
     message: str = ""
     error: str = ""
+    expires_in: int = 0                # 上游票据的真实有效期（秒）；0 = 未知，用会话默认 TTL
 
 @dataclass
 class LoginState:
@@ -166,6 +171,14 @@ class MusicPlatform:
     def status(self) -> dict[str, Any]:
         """凭证状态，字段与 vault.status()[key] 保持一致。"""
         raise NotImplementedError
+
+    async def enrich_status(self, status: dict[str, Any]) -> dict[str, Any]:
+        """补全 vault 里看不出、要问一次上游才知道的字段（例如网易云的 uid）。
+
+        `credential_status` 会 await 它；默认原样返回。实现必须自己吞掉网络异常 ——
+        这只是顺手多给点信息，不该让状态查询失败。
+        """
+        return status
 
     def auth_hint(self) -> str:
         """未登录时给模型/用户的提示语。"""
