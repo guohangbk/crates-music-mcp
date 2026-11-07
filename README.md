@@ -1,5 +1,7 @@
 # crates-music-mcp
 
+[![CI](https://github.com/guohangbk/crates-music-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/guohangbk/crates-music-mcp/actions/workflows/ci.yml)
+
 > ### 把你三个音乐 App 的收藏交给 Agent，让它每天替你挑一张对味的歌单。
 >
 > **网易云 · QQ 音乐 · 酷狗** —— 一个 MCP server、27 个工具、一份共享凭证、**零原生依赖**。
@@ -215,5 +217,32 @@ python tests/test_stdio.py all    # 冒烟：27 个工具
 python tests/test_methods.py      # 登录方式目录 + Cookie 导入 + 凭证状态
 python tests/test_analyze_all.py  # 三平台画像（需要本地已有凭证）
 ```
+
+CI（`.github/workflows/ci.yml`）在每次 push / PR 跑 **离线**自检：
+
+| 跑什么 | 为什么是离线 |
+| --- | --- |
+| `test_ncm_native.py`（默认不带 `NCM_LIVE=1`） | 密码学对 FIPS-197 / NIST SP 800-38A 官方向量，不需要账号 |
+| `test_kugou_native.py`（默认不带 `KUGOU_LIVE=1`） | 签名/RSA/AES 对上游 JS 的实际输出，参照值已固化进测试 |
+| `test_profile_rank.py` / `test_methods.py` / `test_poll_fast.py` / `test_stdio.py` | 纯本地逻辑与 stdio 协议 |
+| 打包检查 | 构建 wheel/sdist，断言 `platforms/core/` 与 `LICENSE` 都在里面 |
+
+联网那部分（`NCM_LIVE=1` / `KUGOU_LIVE=1`）故意不进 CI：需要真实账号凭证，而且 CI 机房在境外、
+访问国内音乐接口不稳定，跑出来是假红。要验联网就看「自检」那一节，在本地跑。
+
+## 发布到 PyPI
+
+仓库里带了 `.github/workflows/publish.yml`，用 **Trusted Publishing**（OIDC）——**不需要在仓库里存 token**。
+要发布需要先在 PyPI 侧配一次：
+
+1. 在 [PyPI](https://pypi.org/manage/account/publishing/) 加一个 *pending publisher*：
+   Owner `guohangbk`、Repository `crates-music-mcp`、Workflow `publish.yml`、Environment `pypi`
+   （TestPyPI 上用同一个路径再配一份，Environment 填 `testpypi`）；
+2. 在 GitHub 仓库的 Settings → Environments 建两个环境：`pypi` 与 `testpypi`
+   （想加人工审批就在 `pypi` 上配 required reviewers）；
+3. 先练手：Actions → **Publish** → Run workflow → 选 `testpypi`；
+4. 正式发：在 GitHub 上发一个 Release（会触发 `published`），或在 workflow 里选 `pypi`。
+
+版本号在 `pyproject.toml` 的 `version`，发之前记得改；PyPI 不允许覆盖同名版本。
 
 

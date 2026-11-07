@@ -1,0 +1,99 @@
+name: Publish
+
+# 两条路：
+#   * GitHub Release 一发（published）→ 打正式 PyPI；
+#   * 手动 workflow_dispatch → 默认先打 TestPyPI（练手用，不污染正式包）。
+#
+# 用 **Trusted Publishing**（OIDC），不需要在仓库里存 PyPI token。
+# 需要先在 PyPI 上配一次（见 README「发布」一节）：
+#   PyPI     → Project: crates-music-mcp，Owner: guohangbk，Repository: crates-music-mcp，
+#              Workflow: publish.yml，Environment: pypi
+#   TestPyPI → 同样一份，Environment: testpypi
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 发布到哪个仓库
+        type: choice
+        options: ["testpypi", "pypi"]
+        default: "testpypi"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 打包
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 构建 sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: 校验产物
+        run: |
+          python - <<'PY'
+          import glob
+          import tarfile
+          import zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          names = set(zipfile.ZipFile(wheel).namelist())
+          assert "music_mcp/platforms/core/kugou_crypto.py" in names, "wheel 缺 core 子包"
+          assert any(name.endswith("licenses/LICENSE") for name in names), "wheel 缺 LICENSE"
+
+          sdist = glob.glob("dist/*.tar.gz")[0]
+          with tarfile.open(sdist) as archive:
+              content = set(archive.getnames())
+          assert any(name.endswith("LICENSE") for name in content), "sdist 缺 LICENSE"
+          print(f"OK：{wheel} / {sdist}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    name: 发布到 TestPyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write          # Trusted Publishing 要的就是它
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    name: 发布到 PyPI
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.repository == 'pypi')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
