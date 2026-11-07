@@ -31,8 +31,8 @@ from typing import Any
 import httpx
 
 from .. import vault
-from . import kugou_native
-from .base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
+from .core import kugou_native
+from .core.base import (CreateResult, LoginStart, LoginState, LoginTicket, MusicPlatform,
                     Platform, Song, name_matches, song_key)
 
 CALL_RETRIES = 2             # 网络抖动时的重试次数（引擎那套崩溃重试已经不需要了）

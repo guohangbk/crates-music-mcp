@@ -26,7 +26,7 @@ import httpx
 
 from . import paths, vault
 from .platforms import DEFAULT_ORDER, get_platform, resolve_keys
-from .platforms.base import MusicPlatform, Song, key_of, normalize, song_key
+from .platforms.core.base import MusicPlatform, Song, key_of, normalize, song_key
 
 
 # 心情 / 场景关键词 -> 主题名。顺序有意义：先匹配到的先用（负面情绪放前面，

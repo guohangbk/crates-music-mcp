@@ -133,28 +133,18 @@ create_daily_playlist(include="晴天 - 周杰伦", count=20)     # 点名的歌
 
 协议不是凭空写的：**网易云、酷狗的签名与加密都是照公开实现逐字复刻的**，QQ 直接用现成的纯 Python 库。
 
-| 平台 | 上游项目 | 许可 | 我们和它的关系 |
-| --- | --- | --- | --- |
-| QQ 音乐 | [L-1124/QQMusicApi](https://github.com/L-1124/QQMusicApi)（[文档](https://l-1124.github.io/QQMusicApi/)） | MIT | **直接依赖**：`pip install qqmusic-api-python`，登录/搜索/歌单都走它 |
-| 网易云 | [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) | MIT | **协议参照**：weapi/eapi、APP_CONF、指纹 Cookie 照它实现（`ncm_crypto.py` / `ncm_native.py`） |
-| 网易云（前身） | [Binaryify/NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) | MIT | 上面那个的上游 —— **2024-02 已归档、仓库清空**，所以我们的底稿取自引擎打包产物而不是它 |
-| 网易云（打包方） | [2061360308/NeteaseCloudMusic_PythonSDK](https://github.com/2061360308/NeteaseCloudMusic_PythonSDK) | MIT | 早期装过的 `pymusiclibrary` 就是它；我们读的就是它打出来的 `ncm_music_api.dll` 里**明文内嵌的 JS** |
-| 酷狗 | [MakcRe/KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) | MIT | **协议参照**：`kugou_music_api.dll` 里那份 JS 就是它的压缩版，签名/AES/RSA 逐字节对拍（`kugou_crypto.py` / `kugou_native.py`） |
-
-顺手记一笔差异：网易云**加歌**我们用 `/api/playlist/manipulate/tracks`（eapi），api-enhanced 用
-`/api/playlist/track/add`（weapi）；酷狗读曲目我们用 App 现行的 `/v4/get_list_all_file_v3`，老的
-gcid 路由 2026-11-07 起回空。两条路都实测可用，只是各走各的。
+| 平台 | 上游项目 | 许可 |
+| --- | --- | --- |
+| QQ 音乐 | [L-1124/QQMusicApi](https://github.com/L-1124/QQMusicApi)（[文档](https://l-1124.github.io/QQMusicApi/)） | MIT |
+| 网易云 | [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) | MIT |
+| 酷狗 | [MakcRe/KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) | MIT |
 
 ## 依赖与自检
 
 运行依赖只有 `mcp` / `qqmusic-api-python` / `qrcode` / `Pillow` / `httpx` / `uvicorn`，
 由 `pyproject.toml` 声明，pip 自动装齐。
 
-**三平台都跟原生库解耦了**：网易云、酷狗纯 Python 直连官方 WebAPI（自己算签名/加密），
-QQ 走第三方的纯 Python 库。所以不需要容器、不需要 sidecar、不需要 `pymusiclibrary`
-（那个包的 manylinux wheel 里塞的是 Windows DLL，本来也装不起来）。
-密码学部分全部是标准库实现（`aes.py` / `ncm_crypto.py` / `kugou_crypto.py`），并用
-FIPS-197、NIST SP 800-38A 官方向量 + 上游 JS 输出双重对拍：
+自检：
 
 ```bash
 python tests/test_ncm_native.py                # 网易云：AES/RSA/weapi/eapi 与官方向量
@@ -164,9 +154,55 @@ KUGOU_LIVE=1 python tests/test_kugou_native.py #   再加真实搜索 / 歌单 /
 python tests/test_login_resumable.py           # 登录会话：有效期 + 跨进程续（含另起进程验证）
 ```
 
+## 项目结构
+
+```
+music_mcp/
+├── app.py              入口：起 MCP server（stdio / http 两种传输，4 个命令都走它）
+├── servers.py          MCP 工具定义（21 个）：校验参数 → 转给业务层 → 结果 JSON 化
+├── compose.py          业务编排：画像加权选曲、跨平台建单、最近 14 天去重
+├── login.py            登录会话注册表：发号 / 回收 / 落盘（跨进程可续）
+├── vault.py            共享凭证库：三个进程共用一份，读-刷新-回写用 flock 互斥
+├── paths.py            数据目录（用户级，MUSIC_DATA_DIR 一处覆盖）
+├── qr.py               二维码本地渲染 + 127.0.0.1 回环图片服务
+└── platforms/
+    ├── __init__.py     平台注册表：枚举 ↔ 实现
+    ├── qq.py           QQ 音乐 · 平台层（登录流程、收藏/推荐/搜索/建单）
+    ├── netease.py      网易云 · 平台层（同上 + Cookie 续期）
+    ├── kugou.py        酷狗 · 平台层（同上）
+    └── core/           ← 共用底座 + 各平台协议实现（纯 Python 传输层）
+        ├── base.py          平台接口 + 通用结构/工具（Song / LoginStart / normalize / dedupe…）
+        ├── aes.py           通用 AES-128/192/256（CBC/ECB + PKCS7，标准库实现）
+        ├── ncm_crypto.py    网易云 · 参数加密：weapi（双层 AES + 裸 RSA）/ eapi（AES-ECB + md5）
+        ├── ncm_native.py    网易云 · 路由与请求：域名、参数、指纹 Cookie、响应归一
+        ├── kugou_crypto.py  酷狗 · 签名/加密：md5 盐值签名、两种 RSA、三处 AES、设备指纹
+        └── kugou_native.py  酷狗 · 路由与请求：13 条上游接口
+```
+
+一句话分工：
+
+| 层 | 负责 | 不知道的事 |
+| --- | --- | --- |
+| `core/*_crypto.py` | **怎么签名**：把参数算成上游要的样子 | 不知道要调哪个接口 |
+| `core/*_native.py` | **打哪个请求**：URL / 参数 / 头 / 响应 | 不知道"我喜欢"是什么 |
+| `platforms/*.py` | **业务上要干什么**：登录编排、收藏、搜索、建单 | 不碰签名细节 |
+| `servers.py` | **对外暴露哪些工具** | 任何平台差异 |
+
+新增一个平台 = 一个 `x_crypto.py` + 一个 `x_native.py`（放 `core/`）+ 一个 `x.py`（放 `platforms/`），
+再加一行注册。
+
+## 许可证
+
+[MIT](LICENSE)。三个平台的上游实现同样是 MIT（见上表）——**我们只对齐了协议行为、没有复制它们的代码**：
+网易云/酷狗的签名与加密都是照公开协议自己实现的，QQ 那个库是以依赖形式引入的。
+
 ## 开发
 
 ```bash
 pip install -e .
-python tests/test_stdio.py all   # 冒烟：21 个工具
+python tests/test_stdio.py all    # 冒烟：21 个工具
+python tests/test_methods.py      # 登录方式目录 + Cookie 导入 + 凭证状态
+python tests/test_analyze_all.py  # 三平台画像（需要本地已有凭证）
 ```
+
+

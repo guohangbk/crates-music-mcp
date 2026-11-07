@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from music_mcp import compose, paths  # noqa: E402
-from music_mcp.platforms.base import Song  # noqa: E402
+from music_mcp.platforms.core.base import Song  # noqa: E402
 
 profile = {
     "top_artists": ["G.E.M.邓紫棋", "梁博", "赵雷"],

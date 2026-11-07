@@ -18,7 +18,7 @@ from typing import Any
 
 from . import paths, qr
 from .platforms import get_platform
-from .platforms.base import LoginState, LoginTicket
+from .platforms.core.base import LoginState, LoginTicket
 
 SESSION_TTL = 600
 FINAL_STATUSES = {"succeeded", "expired", "failed", "parse_error"}
