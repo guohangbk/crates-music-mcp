@@ -29,6 +29,8 @@ from .core.ncm_native import NcmNativeClient
 _norm = normalize  # 旧代码里的名字
 
 NCM_LIKED = "喜欢的音乐"
+# 「我喜欢的音乐」的 specialType（实测：我喜欢=5、自建=0、年度歌单=20、十年精选=700）
+NCM_LIKED_SPECIAL_TYPE = 5
 # 扫码登录那个 unikey 的真实寿命（秒）。2026-11-07 实测：第 291 秒仍回 801（等待扫码），
 # 第 306 秒回 800（二维码不存在或已过期）→ 取 300。以前这里写 180、会话却报 600，两个都不对。
 NCM_QR_TTL = 300
@@ -233,6 +235,23 @@ async def _ncm_run(operation):
         cookie = await ncm_credential(force=True)
         return await operation(cookie)
 
+def _pick_liked_ncm(playlists: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """挑出「我喜欢的音乐」，并说明按什么挑中的。
+
+    优先级：specialType(5) → 歌单名 → 第一个歌单。
+    specialType 才是结构化依据（实测：我喜欢=5，自建=0，年度歌单=20，十年精选=700）；
+    只按名字挑，遇到用户把歌单改名、或自建歌单叫「喜欢的音乐」都会判错。
+    """
+    picked = [pl for pl in playlists
+              if int(pl.get("specialType") or 0) == NCM_LIKED_SPECIAL_TYPE]
+    if picked:
+        return picked, f"specialType={NCM_LIKED_SPECIAL_TYPE}"
+    picked = [pl for pl in playlists if NCM_LIKED in str(pl.get("name") or "")]
+    if picked:
+        return picked, "name"
+    return ([playlists[0]], "first_playlist") if playlists else ([], "none")
+
+
 async def ncm_liked_songs() -> tuple[list[tuple[str, str]], list[str], dict[str, Any]]:
     """Return (songs, sources, diagnostics). Cookie-based, no login session needed."""
     diag: dict[str, Any] = {"configured": vault.ncm_cookie_is_valid(vault.ncm_cookie()), "errors": []}
@@ -254,9 +273,8 @@ async def ncm_liked_songs() -> tuple[list[tuple[str, str]], list[str], dict[str,
         diag["playlists"] = len(playlists)
         titles = [str(pl.get("name") or "") for pl in playlists]
         diag["playlist_titles"] = titles[:20]
-        targets = [pl for pl in playlists if NCM_LIKED in str(pl.get("name") or "")]
-        if not targets and playlists:
-            targets = [playlists[0]]
+        targets, picked_by = _pick_liked_ncm(playlists)
+        diag["liked_picked_by"] = picked_by
         songs: list[tuple[str, str]] = []
         sources: list[str] = []
         for pl in targets:
@@ -602,6 +620,129 @@ class NeteasePlatform(MusicPlatform):
             return CreateResult(platform=self.key.value, ok=False, playlist_name=name,
                                 error=f"{exc.__class__.__name__}: {exc}")
 
+    async def search_items(self, keyword: str, limit: int = 10,
+                           ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """搜索歌曲，返回统一结构（网易云的歌手在 ar[] 里）。"""
+        async def _find(cookie: str):
+            client = make_ncm_client(cookie=cookie)
+            rows = await client.cloud_search(keyword.strip(),
+                                             limit=max(1, min(int(limit or 10), 50)))
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("name"):
+                    continue
+                artists = row.get("ar") or row.get("artists") or []
+                album = row.get("al") or row.get("album") or {}
+                items.append({
+                    "name": str(row.get("name") or ""),
+                    "artist": str((artists[0] or {}).get("name") or "") if artists else "",
+                    "id": str(row.get("id") or ""),
+                    "album": str(album.get("name") or ""),
+                    "duration_ms": int(row.get("dt") or row.get("duration") or 0),
+                })
+            return items
+
+        return await _ncm_run(_find), {}
+
+    async def playlist_tracks(self, playlist_id: str, limit: int = 0,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """读某个歌单的曲目（playlist_id 就是 my_playlists 的 id）。"""
+        pid = str(playlist_id or "").strip()
+        if not pid.isdigit():
+            return [], {"error": f"playlist_id 必须是数字，收到 {playlist_id!r}"}
+
+        async def _fetch(cookie: str):
+            client = make_ncm_client(cookie=cookie)
+            return await client.playlist_tracks(int(pid))
+
+        tracks = await _ncm_run(_fetch)
+        songs: list[Song] = []
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            _remember(track)          # 顺手记住 id：以后建单/加歌不用再搜一遍
+            artists = track.get("ar") or track.get("artists") or []
+            name = str(track.get("name") or "")
+            if name:
+                songs.append(Song(name, str((artists[0] or {}).get("name") or "") if artists else ""))
+        total = len(songs)
+        return (songs[:limit] if limit and limit > 0 else songs), {"total": total}
+
+    async def add_tracks(self, playlist_id: str, songs: list[Song]) -> dict[str, Any]:
+        """给已有歌单加歌：歌名 → 平台内搜索 → 拿 id → playlist_track_add。"""
+        pid = str(playlist_id or "").strip()
+        if not pid.isdigit():
+            return {"ok": False, "service": self.key.value,
+                    "error": f"playlist_id 必须是数字，收到 {playlist_id!r}"}
+        if not vault.ncm_cookie_is_valid(vault.ncm_cookie()):
+            return {"ok": False, "service": self.key.value, "error": NCM_AUTH_HINT,
+                    "need_login": True}
+
+        async def _add(cookie: str):
+            client = make_ncm_client(cookie=cookie)
+            matched: list[int] = []
+            matched_meta: list[dict[str, str]] = []
+            failed: list[str] = []
+            ids: set[int] = set()
+            for song in songs:
+                query = f"{song.name} {song.artist}".strip()
+                known = _KNOWN_IDS.get(song_key(song.name, song.artist))
+                if known and known not in ids:
+                    ids.add(known)
+                    matched.append(known)
+                    matched_meta.append(song.as_dict())
+                    continue
+                try:
+                    candidates = await client.cloud_search(query, limit=5)
+                except Exception as exc:  # noqa: BLE001 - 单首失败不该毁掉整批
+                    failed.append(f"{query}（搜索出错：{exc.__class__.__name__}）")
+                    continue
+                chosen = _ncm_pick(candidates, song.artist, ids, song.name)
+                try:
+                    song_id = int((chosen or {}).get("id") or 0)
+                except (TypeError, ValueError):
+                    song_id = 0
+                if not song_id:
+                    failed.append(query)
+                    continue
+                ids.add(song_id)
+                matched.append(song_id)
+                matched_meta.append(song.as_dict())
+            if not matched:
+                return {"ok": False, "service": self.key.value, "playlist_id": pid,
+                        "failed": failed, "error": "没有匹配到任何歌曲"}
+            result = await client.playlist_track_add(int(pid), matched)
+            code = int((result or {}).get("code") or 0)
+            return {"ok": code == 200, "service": self.key.value, "playlist_id": pid,
+                    "added": len(matched) if code == 200 else 0, "matched": matched_meta,
+                    "failed": failed, "track_ids": matched,
+                    "error": "" if code == 200 else json.dumps(result, ensure_ascii=False)[:200]}
+
+        return await _ncm_run(_add)
+
+    async def recently_played(self, limit: int = 50,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """网易云听歌排行（最近播放）。type=0 所有时间，拿不到就退一周。"""
+        limit = max(1, min(int(limit or 50), 200))
+        async def _fetch(cookie: str):
+            client = make_ncm_client(cookie=cookie)
+            uid = await ncm_ensure_uid()
+            if not uid:
+                return [], {"error": "拿不到网易云 uid（Cookie 可能已失效）"}
+            rows = await client.play_records(uid, type_=0, limit=limit)
+            picked = "allData"
+            if not rows:
+                rows = await client.play_records(uid, type_=1, limit=limit)
+                picked = "weekData"
+            return rows, {"uid": uid, "bucket": picked, "rows": len(rows)}
+
+        rows, diag = await _ncm_run(_fetch)
+        songs = [Song(str(row.get("name") or ""), str(row.get("artist") or "")) for row in rows]
+        songs = [song for song in songs if song.name]
+        details = [{"name": row.get("name"), "artist": row.get("artist"),
+                    "play_count": row.get("play_count")} for row in rows]
+        return songs, {**diag, "details": details[:limit]}
+
     async def delete_playlist(self, playlist_id: str) -> dict[str, Any]:
         """删除网易云歌单。"""
         cookie = vault.ncm_cookie()
@@ -625,7 +766,7 @@ class NeteasePlatform(MusicPlatform):
                     "service": self.key.value}
 
     async def my_playlists(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """列出网易云创建的歌单。"""
+        """列出网易云创建的歌单（统一字段：id / name / track_count）。"""
         diag: dict[str, Any] = {"errors": []}
         cookie = vault.ncm_cookie()
         if not cookie:
@@ -646,7 +787,8 @@ class NeteasePlatform(MusicPlatform):
                 items.append({
                     "id": str(pl.get("id") or ""),
                     "name": str(pl.get("name") or ""),
-                    "track_count": pl.get("trackCount"),
+                    # 统一成整数：上游没给就是 0，别再往外吐 null
+                    "track_count": int(pl.get("trackCount") or 0),
                 })
             diag["count"] = len(items)
             return items, diag

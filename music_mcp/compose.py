@@ -616,6 +616,9 @@ async def analyze(services: Any = "") -> dict[str, Any]:
         diagnostics[member.value] = diag
         if songs:
             sources.append(f"{platform.label}: {', '.join(src) or '无'}")
+            # 收藏快照与建单流程**同一口径**：state/<platform>_liked.json。
+            # 以前只有建歌单会写，跑完 analyze 反而在 state/ 里找不到快照。
+            save_liked(member.value, songs, src)
         all_songs.extend((song.name, song.artist) for song in songs)
     need_login = [name for name, info in diagnostics.items() if info.get("need_login")]
     if not all_songs:

@@ -1,9 +1,13 @@
+# 运行依赖（与 pyproject.toml 的 [project.dependencies] 保持一致）
 mcp>=1.10,<2
 uvicorn>=0.30
 httpx>=0.27
 qqmusic-api-python>=0.5.0
 Pillow>=10.0
-# 网易云默认后端：本地库（QuickJS + 预编译动态库），不起容器/服务
-pymusiclibrary>=0.0.4
-# 本地渲染网易云登录二维码（SDK 引擎不返回 qrimg）
+# 本地渲染登录二维码（三个平台都用得上）
 qrcode>=7.4
+
+# 注意：这里**不该**出现 pymusiclibrary。
+# 三个平台都走纯 Python 实现（网易云/酷狗自己算签名与加密，QQ 用第三方的纯 Python 库），
+# 而 pymusiclibrary 的 manylinux wheel 里装的是 Windows DLL，
+# 装上只会在 Linux 上报 `OSError: libengine.so: cannot open shared object file`。

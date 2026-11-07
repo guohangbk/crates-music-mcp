@@ -41,7 +41,12 @@ CALL_RETRIES = 2             # 网络抖动时的重试次数（引擎那套崩�
 # 以前这里写 180，没有任何依据。
 QR_TTL_SECONDS = 600
 
-LIKE_TITLE_MARKERS = ("我喜欢", "喜欢")
+LIKE_TITLE_MARKERS = ("我喜欢", "我喜欢的音乐")   # 不写单独的「喜欢」：会把「喜欢民谣」这种自建歌单也吃进来
+# 酷狗的**系统收藏单有两个**：默认收藏(is_def=1, listid=1) 与 我喜欢(is_def=2, listid=2)。
+# 只认 2 会漏掉老版本/迁移账号里落在「默认收藏」的歌；两个都取，空的那个自然不出歌。
+# 「默认列表」(listid=6, is_def=null) **不算**：实测它与「我喜欢」只有 5% 重叠（84 首里 80 首独有），
+# 是另一个列表，混进来等于往收藏池里塞不相干的歌。
+KUGOU_LIKED_LISTIDS = (1, 2)
 TRACK_PAGE_SIZE = 300
 TRACK_MAX_PAGES = 20
 
@@ -208,6 +213,30 @@ async def _playlist_tracks(cookie: str, listid: str = "", collection_id: str = "
     return songs
 
 
+def _pick_liked_kugou(lists: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """挑出收藏单，并说明按什么挑中的。
+
+    酷狗有**两个**系统收藏单：默认收藏(is_def=1) 与 我喜欢(is_def=2)，两个都要取 ——
+    老版本/迁移账号的收藏可能整批落在「默认收藏」里，只认「我喜欢」会漏歌。
+    实测（2026-11-07）本号：我喜欢 95 首、默认收藏 0 首（空单不影响结果）。
+
+    优先级：is_def/listid ∈ {1,2} → 歌单名 → 第一个歌单。
+    「默认列表」(listid=6) 的 is_def 是 null、内容与我喜欢只有 5% 重叠，属于另一个列表，
+    不能混进收藏；需要它就用 playlist_songs(id=6) 单独读。
+    """
+    picked = [pl for pl in lists
+              if int(pl.get("is_def") or 0) in KUGOU_LIKED_LISTIDS
+              or int(pl.get("list_create_listid") or pl.get("listid") or 0) in KUGOU_LIKED_LISTIDS]
+    if picked:
+        return picked, f"is_def/listid in {KUGOU_LIKED_LISTIDS}"
+    picked = [pl for pl in lists
+              if any(marker in str(pl.get("listname") or pl.get("name") or "")
+                     for marker in LIKE_TITLE_MARKERS)]
+    if picked:
+        return picked, "name"
+    return ([lists[0]], "first_playlist") if lists else ([], "none")
+
+
 class KugouPlatform(MusicPlatform):
     key = Platform.KUGOU
     label = "酷狗音乐"
@@ -319,7 +348,7 @@ class KugouPlatform(MusicPlatform):
         return songs, sources, diag
 
     async def favorites(self) -> tuple[list[Song], list[str], dict[str, Any]]:
-        """收藏：先取用户歌单，再找「我喜欢」那一份的曲目。"""
+        """收藏：取系统的两个收藏单（默认收藏 is_def=1 + 我喜欢 is_def=2），合并后去重。"""
         diag: dict[str, Any] = {"errors": []}
         cookie = vault.kugou_cookie()
         if not vault.kugou_cookie_is_valid(cookie):
@@ -336,11 +365,8 @@ class KugouPlatform(MusicPlatform):
         lists = _songs_from(payload.get("data") or payload)
         diag["playlists"] = len(lists)
         diag["playlist_titles"] = [str(pl.get("listname") or pl.get("name") or "") for pl in lists[:20]]
-        targets = [pl for pl in lists
-                   if any(marker in str(pl.get("listname") or pl.get("name") or "")
-                          for marker in LIKE_TITLE_MARKERS)]
-        if not targets and lists:
-            targets = [lists[0]]
+        targets, picked_by = _pick_liked_kugou(lists)
+        diag["liked_picked_by"] = picked_by
 
         songs: list[Song] = []
         sources: list[str] = []
@@ -387,6 +413,114 @@ class KugouPlatform(MusicPlatform):
             if _song_hash(item) and name_matches(_song_name(item), name):
                 return item
         return None
+
+    async def search_items(self, keyword: str, limit: int = 10,
+                           ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """搜索歌曲，返回统一结构（酷狗搜索结果是 CamelCase 字段）。"""
+        payload = await call("search", keywords=keyword.strip(), page=1,
+                             pagesize=max(1, min(int(limit or 10), 50)))
+        items: list[dict[str, Any]] = []
+        for row in _songs_from(payload.get("data") or payload):
+            hash_value = _song_hash(row)
+            if not hash_value:
+                continue
+            items.append({
+                "name": _song_name(row),
+                "artist": _song_artist(row),
+                "id": hash_value,          # 酷狗用 hash 标识一首歌
+                "album_id": str(row.get("album_id") or row.get("AlbumID") or ""),
+                "audio_id": str(row.get("album_audio_id") or row.get("MixSongID")
+                                or row.get("mixsongid") or row.get("Audioid") or ""),
+                "duration_ms": int(row.get("timelen") or row.get("Duration") or 0),
+            })
+        return items, {"keywords": keyword}
+
+    async def playlist_tracks(self, playlist_id: str, limit: int = 0,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """读歌单曲目。数字 id 走 listid；``collection_x_y_z`` 形态走全局歌单 id。"""
+        pid = str(playlist_id or "").strip()
+        if not pid:
+            return [], {"error": "playlist_id 为空"}
+        cookie = vault.kugou_cookie()
+        if not vault.kugou_cookie_is_valid(cookie):
+            return [], {"need_login": True, "error": self.auth_hint()}
+        listid = pid if pid.isdigit() else ""
+        songs = await _playlist_tracks(cookie, listid=listid,
+                                       collection_id="" if listid else pid)
+        total = len(songs)
+        return (songs[:limit] if limit and limit > 0 else songs), {
+            "total": total, "by": "listid" if listid else "global_collection_id"}
+
+    async def add_tracks(self, playlist_id: str, songs: list[Song]) -> dict[str, Any]:
+        """给已有歌单加歌（listid + ``歌名|hash|album_id|audio_id``，与建单同一口径）。"""
+        pid = str(playlist_id or "").strip()
+        if not pid.isdigit():
+            return {"ok": False, "service": self.key.value,
+                    "error": f"酷狗加歌要 listid 数字 id，收到 {playlist_id!r}"}
+        cookie = vault.kugou_cookie()
+        if not vault.kugou_cookie_is_valid(cookie):
+            return {"ok": False, "service": self.key.value, "need_login": True,
+                    "error": self.auth_hint()}
+        entries: list[str] = []
+        matched_meta: list[dict[str, str]] = []
+        failed: list[str] = []
+        for song in songs:
+            query = f"{song.name} {song.artist}".strip()
+            try:
+                hit = await self.search(song.name, song.artist)
+            except Exception as exc:  # noqa: BLE001 - 单首失败不该毁掉整批
+                failed.append(f"{query}（搜索出错：{exc.__class__.__name__}）")
+                continue
+            if not hit:
+                failed.append(query)
+                continue
+            hash_value = _song_hash(hit)
+            album_id = str(hit.get("album_id") or hit.get("AlbumID") or "")
+            audio_id = str(hit.get("album_audio_id") or hit.get("MixSongID")
+                           or hit.get("mixsongid") or hit.get("Audioid") or "")
+            entries.append("|".join(part for part in
+                                    (_song_name(hit), hash_value, album_id, audio_id) if part))
+            matched_meta.append(song.as_dict())
+        if not entries:
+            return {"ok": False, "service": self.key.value, "playlist_id": pid,
+                    "failed": failed, "error": "没有匹配到任何歌曲"}
+        added = await call("playlist_tracks_add", cookie=cookie, listid=int(pid),
+                           data=",".join(entries))
+        ok = int(added.get("status") or 0) == 1 or int(added.get("error_code") or 0) == 0
+        return {"ok": ok, "service": self.key.value, "playlist_id": pid,
+                "added": len(entries) if ok else 0, "matched": matched_meta if ok else [],
+                "failed": failed,
+                "error": "" if ok else json.dumps(added, ensure_ascii=False)[:200]}
+
+    async def recently_played(self, limit: int = 50,
+                              ) -> tuple[list[Song], dict[str, Any]]:
+        """酷狗听歌历史（最近播放）。按上游给的 bp 游标翻页。"""
+        limit = max(1, min(int(limit or 50), 200))
+        cookie = vault.kugou_cookie()
+        if not vault.kugou_cookie_is_valid(cookie):
+            return [], {"need_login": True, "error": self.auth_hint()}
+        songs: list[Song] = []
+        details: list[dict[str, Any]] = []
+        bp = ""
+        for _ in range(10):
+            try:
+                body = await call("user_history", cookie=cookie, bp=bp)
+            except Exception as exc:  # noqa: BLE001 - 已拿到的先返回
+                return songs, {"error": f"user_history: {exc.__class__.__name__}: {exc}",
+                               "details": details[:limit]}
+            data = body.get("data") or {}
+            for entry in data.get("songs") or []:
+                info = entry.get("info") or {}
+                name = str(info.get("name") or "")
+                if not name:
+                    continue
+                songs.append(Song(name, str(info.get("singername") or "")))
+                details.append({"name": name, "artist": str(info.get("singername") or ""),
+                                "played_at": entry.get("ot"), "play_count": entry.get("pc")})
+            bp = str(data.get("bp") or "")
+            if len(songs) >= limit or not data.get("has_more") or not bp:
+                break
+        return songs[:limit], {"total": len(songs), "details": details[:limit]}
 
     async def create_playlist(self, name: str, songs: list[Song],
                               count: int) -> CreateResult:
@@ -472,7 +606,7 @@ class KugouPlatform(MusicPlatform):
                     "service": self.key.value}
 
     async def my_playlists(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """列出酷狗创建的歌单。"""
+        """列出酷狗创建的歌单（统一字段：id / name / track_count）。"""
         diag: dict[str, Any] = {"errors": []}
         cookie = vault.kugou_cookie()
         if not vault.kugou_cookie_is_valid(cookie):
@@ -484,9 +618,12 @@ class KugouPlatform(MusicPlatform):
             items = []
             for pl in lists:
                 items.append({
-                    "listid": str(pl.get("listid") or pl.get("id") or ""),
+                    "id": str(pl.get("listid") or pl.get("list_create_listid")
+                              or pl.get("id") or ""),
                     "name": str(pl.get("listname") or pl.get("name") or ""),
-                    "count": int(pl.get("count") or 0),
+                    # 上游字段叫 count，统一成 track_count（以前这里叫 count，
+                    # 客户端按 track_count 读就是 null）
+                    "track_count": int(pl.get("count") or 0),
                 })
             diag["count"] = len(items)
             return items, diag
