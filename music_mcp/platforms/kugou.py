@@ -41,7 +41,10 @@ CALL_TIMEOUT = 40.0
 CALL_RETRIES = 2
 MIN_INTERVAL = 0.35          # 两次调用之间的最小间隔，避免连发触发风控
 WORKER = Path(__file__).with_name("kugou_worker.py")
-QR_TTL_SECONDS = 180
+# 酷狗二维码有效期：2026-11-07 实测（15 秒一 poll）**480 秒仍回 code=1（待扫）**，
+# 没等到过期点，所以别编一个更小的数 —— 上报"我们最多留多久"（会话 TTL 600）。
+# 以前这里写 180，没有任何依据。
+QR_TTL_SECONDS = 600
 
 _last_call = 0.0
 _call_lock = asyncio.Lock()
@@ -281,7 +284,7 @@ class KugouPlatform(MusicPlatform):
         return [
             {"method": "qr", "label": "酷狗 App 扫码（推荐）",
              "account": "酷狗音乐 App 当前登录的账号", "needs": "酷狗音乐 App 扫一扫",
-             "note": "180 秒有效，最省事"},
+             "note": f"至少 8 分钟有效（实测），过期就重新 login_start"},
             {"method": "phone_code", "label": "手机验证码",
              "account": "手机号对应的酷狗账号", "needs": "phone + 短信验证码", "note": "无需二维码"},
         ]
@@ -315,7 +318,7 @@ class KugouPlatform(MusicPlatform):
                 return LoginStart(ok=False, status="failed",
                                   error=f"发送验证码失败: {str(payload)[:200]}")
             return LoginStart(ok=True, status="awaiting_code",
-                              ticket=LoginTicket({"phone": phone}),
+                              ticket=LoginTicket({"phone": phone}, None, True),
                               message=f"验证码已发送到 {phone}")
         if method != "qr":
             return LoginStart(ok=False, status="failed", error=f"不支持的登录方式: {method}")
@@ -325,8 +328,10 @@ class KugouPlatform(MusicPlatform):
         # 首选「登录链接 + 本地渲染」（见 login_qr_create 的注释）；
         # 拿不到内容时退回 login_qr_key 里引擎已经渲染好的 PNG。
         raw = await self.login_qr_create(key) or fallback_image
-        return LoginStart(ok=True, status="waiting", ticket=LoginTicket({"unikey": key}),
-                          qr_image=_kugou_qr_data_url(raw),
+        # 票据只有 key，poll 时现查（引擎每条路由都是一次性进程）→ 可落盘、可跨进程续
+        return LoginStart(ok=True, status="waiting",
+                          ticket=LoginTicket({"unikey": key}, None, True),
+                          qr_image=_kugou_qr_data_url(raw), expires_in=QR_TTL_SECONDS,
                           message="二维码已作为图片返回。扫码后调用 login_poll。")
 
     async def login_poll(self, ticket: LoginTicket) -> LoginState:
