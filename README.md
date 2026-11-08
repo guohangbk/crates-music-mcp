@@ -1,6 +1,7 @@
 # crates-music-mcp
 
 [![CI](https://github.com/guohangbk/crates-music-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/guohangbk/crates-music-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/crates-music-mcp)](https://pypi.org/project/crates-music-mcp/)
 
 > ### 把你三个音乐 App 的收藏交给 Agent，让它每天替你挑一张对味的歌单。
 >
@@ -13,45 +14,36 @@
 | --- | --- |
 | **读** | 三家「我喜欢 / 收藏」+ 今日推荐全部拉下来，按「歌名 + 歌手」跨平台去重（实测一份池子 **1500+ 首**） |
 | **懂** | 把候选池交给模型，产出结构化偏好画像：常听歌手、口味、情绪倾向，缓存到本地，下次不用重算 |
-| **推** | 按画像权重从池子里挑歌，避开最近 14 天推过的，**在目标平台现场搜歌**再建单（搜不到就跳过，不硬塞） |
+| **推** | 按画像权重从池子里挑歌，避开最近 7 天推过的（`avoid_days` 可关），**在目标平台现场搜歌**再建单（搜不到就跳过，不硬塞） |
 
 全程在你自己机器上跑：**没有容器、没有 sidecar、没有云端账号**，凭证就是你自己的登录 Cookie。
 Windows / Linux 行为一致——三平台的协议都是纯 Python 实现的。
 
 ## 一分钟跑通
 
-**推荐**：直接从仓库装，不用先克隆：
+**推荐 · 不用预装 Python、不用建 venv**。`uvx` 会自己把环境准备好（之后走缓存），装上 uv 就行：
+`winget install astral-sh.uv`，或 `pipx install uv`。
 
 ```bash
-pip install git+https://github.com/guohangbk/crates-music-mcp.git
+uvx --from crates-music-mcp crates-music           # 直接跑
+uvx --from crates-music-mcp==0.1.1 crates-music    # 要钉版本就带上 ==
 ```
 
-如果卡在 `Could not connect to server`（国内直连 github.com:443 经常被挡），两个办法：
-挂代理，或改用 SSH 地址：
+**常规装法**（本机已有 Python 3.10+，且自己能管好环境）：
 
 ```bash
-pip install "git+ssh://git@github.com/guohangbk/crates-music-mcp.git"
-```
-
-或者克隆下来再装 —— 想改代码、跑自检就用这种：
-
-```bash
-git clone https://github.com/guohangbk/crates-music-mcp.git   # 连不上就用 git@github.com:guohangbk/crates-music-mcp.git
-cd crates-music-mcp
-pip install -e .
-```
-
-已发布到 PyPI，任选一种装法：
-
-```bash
-uvx --from crates-music-mcp crates-music
 pip install crates-music-mcp
 ```
 
-装完得到 4 个命令：
+> pip **不会**替你建 venv，也**不会**把命令塞进 PATH —— `crates-music` 会落在那个环境的 `Scripts\` 里。
+> 装进系统 Python 的话，接客户端时往往得自己填绝对路径；想省心就用上面的 uvx。
+
+> 想跑**尚未发布的最新提交**、改代码、跑自检 → 见文末「开发」一节。
+
+装完（或用 uvx 直接跑）得到 4 个命令：
 
 ```bash
-crates-music      # 单 server，全部 27 个工具（默认 stdio）—— 推荐
+crates-music      # 单 server，全部 28 个工具（默认 stdio）—— 推荐
 crates-auth       # 只带登录/凭证工具
 crates-profile    # 只带画像工具
 crates-playlist   # 只带建单/推荐工具
@@ -59,19 +51,34 @@ crates-playlist   # 只带建单/推荐工具
 
 接到客户端（**客户端调用时自动拉起进程，用完即退**，不需要常驻、不需要 systemd）：
 
+**推荐：uvx** —— 不依赖 PATH，也不要求本机装过 Python：
+
+```json
+{ "mcpServers": { "music": { "command": "uvx", "args": ["--from", "crates-music-mcp", "crates-music"] } } }
+```
+
+**已经 pip 装好了**（注意 `command` 要能被找到，见下）：
+
 ```json
 { "mcpServers": { "music": { "command": "crates-music", "args": [] } } }
 ```
 
-Codex 用 TOML：
+Codex 用 TOML，uvx 版：
 
 ```toml
 [mcp_servers.music]
-command = "crates-music"
-args = []
+command = "uvx"
+args = ["--from", "crates-music-mcp", "crates-music"]
 ```
 
-工具名会带 server 前缀（如 `music_create_daily_playlist`）。然后就能这样用：
+> **用 pip 的话，两个坑先说**：
+> 1. `command` 得能被找到 —— GUI 客户端是用**系统 PATH** 拉起进程的，而 `crates-music`
+>    躺在某个环境的 `Scripts\` 里（Windows 上常不在 PATH）。这时填绝对路径
+>    （如 `C:\...\Scripts\crates-music.exe`），或者干脆换成 uvx 形态。
+> 2. 也可以写 `python -m music_mcp.app`，但**必须同时把 `TRANSPORT` 设成 `stdio`** ——
+>    这条路径的默认值是 `http`（在 8765 常驻），不设就会一直等不到握手。
+
+工具名会带 server 前缀（Claude Desktop 是 `music_create_daily_playlist`，Codex 是 `mcp__music__create_daily_playlist`）。然后就能这样用：
 
 ```
 你：看看我最近都听什么，给我建一张今天的歌单
@@ -181,7 +188,7 @@ create_daily_playlist(include="晴天 - 周杰伦", count=20)     # 点名的歌
 | `secrets/kugou.json` | 酷狗 Cookie（token + userid） |
 | `state/*_liked.json` | 各平台收藏快照 |
 | `state/music_prefer_profile.json` | 偏好画像 |
-| `state/recent_music_history.json` | 最近 14 天推荐历史（去重口径） |
+| `state/recent_playlist_history.json` | 最近 100 张生成过的歌单（含曲目明细；去重池与 `recent_recommended_tracks` 都从它派生） |
 | `state/login_sessions.json` | 未完成的登录会话（可跨进程续，见上） |
 
 覆盖路径用 `MUSIC_DATA_DIR`（一处决定 `secrets/` 与 `state/`）。
@@ -216,8 +223,8 @@ python tests/test_login_resumable.py           # 登录会话：有效期 + 跨�
 ```
 music_mcp/
 ├── app.py              入口：起 MCP server（stdio / http 两种传输，4 个命令都走它）
-├── servers.py          MCP 工具定义（21 个）：校验参数 → 转给业务层 → 结果 JSON 化
-├── compose.py          业务编排：画像加权选曲、跨平台建单、最近 14 天去重
+├── servers.py          MCP 工具定义（28 个）：校验参数 → 转给业务层 → 结果 JSON 化
+├── compose.py          业务编排：画像加权选曲、跨平台建单、最近 7 天去重（默认）
 ├── login.py            登录会话注册表：发号 / 回收 / 落盘（跨进程可续）
 ├── vault.py            共享凭证库：三个进程共用一份，读-刷新-回写用 flock 互斥
 ├── paths.py            数据目录（用户级，MUSIC_DATA_DIR 一处覆盖）
@@ -250,7 +257,23 @@ music_mcp/
 
 ## 开发
 
+想跟 `master` 上尚未发布的提交（PyPI 上只有发布版）：
+
 ```bash
+pip install git+https://github.com/guohangbk/crates-music-mcp.git
+```
+
+如果卡在 `Could not connect to server`（国内直连 github.com:443 经常被挡），两个办法：挂代理，或改用 SSH 地址：
+
+```bash
+pip install "git+ssh://git@github.com:guohangbk/crates-music-mcp.git"
+```
+
+改代码 / 跑自检用可编辑安装：
+
+```bash
+git clone https://github.com/guohangbk/crates-music-mcp.git   # 连不上就用 git@github.com:guohangbk/crates-music-mcp.git
+cd crates-music-mcp
 pip install -e .
 python tests/test_stdio.py all    # 冒烟：28 个工具
 python tests/test_methods.py      # 登录方式目录 + Cookie 导入 + 凭证状态
