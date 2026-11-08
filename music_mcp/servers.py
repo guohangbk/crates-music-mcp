@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import os
 import time
 from typing import Any
@@ -300,8 +301,13 @@ def build_server(name: str) -> FastMCP:
 
     if "playlist" in parts:
         async def _create_from_list(service: Platform, songs_json: str, count: int,
-                                    playlist_name: str, date: str, prompt: str) -> str:
-            """显式给一份歌单时的公共流程：去重选歌 -> 定名 -> 交给平台建单。"""
+                                    playlist_name: str, date: str, prompt: str,
+                                    avoid_days: int = 7) -> str:
+            """显式给一份歌单时的公共流程：去重选歌 -> 定名 -> 交给平台建单。
+
+            普通建单的歌单名**不带日期前缀**（只有"今日歌单"才带），名字上限 20 字。
+            这条路径**不写歌单台账**：用户明确要的就是这份清单，不该污染日常去重池。
+            """
             platform = get_platform(service)
             if platform is None:
                 return _dump({"ok": False, "error": f"unknown service: {service}"})
@@ -322,19 +328,24 @@ def build_server(name: str) -> FastMCP:
             if isinstance(payload.get("playlist_name"), str) and not playlist_name:
                 playlist_name = payload["playlist_name"]
             day = date or time.strftime("%Y%m%d")
-            name = compose.resolve_name(prompt, playlist_name, day)
-            selected, reused = compose.select_songs(songs, count)
+            # 只调一次 resolve_theme：名字里的随机素材就在这一次里定下来，
+            # 调两次（再来一次 resolve_name）会拿到两组不同的随机素材。
+            theme, name_source = compose.resolve_theme(prompt, playlist_name, day, None, songs)
+            name = compose.limit_name(theme, compose.NAME_LIMIT)      # 普通建单不带日期
+            selected, reused = compose.select_songs(songs, count, None, avoid_days)
             if not selected:
                 return _dump({"ok": False, "error": "没有有效歌曲"})
             created = await platform.create_playlist(name, selected, len(selected))
             result = created.as_dict()
             result["reused_recent"] = reused
+            result["name_source"] = name_source
+            result["avoid_days"] = avoid_days
             return _dump(_with_login_options(result))
 
         @mcp.tool()
         async def create_qq_playlist(songs_json: str, count: int = 20,
                                      playlist_name: str = "", date: str = "",
-                                     prompt: str = "") -> str:
+                                     prompt: str = "", avoid_days: int = 7) -> str:
             """Create a real QQ Music playlist.
 
             songs_json: {"playlist_name":"清晨慢摇","songs":[{"name":"歌名","artist":"歌手"}]}
@@ -342,37 +353,41 @@ def build_server(name: str) -> FastMCP:
             playlist_name: explicit name from the user; leave empty to auto-name
             date:        YYYYMMDD (default today)
             prompt:       original user request, used to decide the name
-            Returns {"ok","playlist_name","playlist_id","added","failed","reused_recent"}.
+            avoid_days:  skip songs recommended in the last N days (default 7; 0 = no dedup)
+            Returns {"ok","playlist_name","playlist_id","added","failed","reused_recent",
+                     "name_source"}.
+            The name has NO date prefix here (only create_daily_playlist adds one),
+            and it is capped at 20 characters.
 
             If the result has need_login=true, this platform is not logged in yet:
             show the methods list to the user, let them pick ONE, then retry.
             """
             return await _create_from_list(Platform.QQ_MUSIC, songs_json, count,
-                                           playlist_name, date, prompt)
+                                           playlist_name, date, prompt, avoid_days)
 
         @mcp.tool()
         async def create_ncm_playlist(songs_json: str, count: int = 20,
                                       playlist_name: str = "", date: str = "",
-                                      prompt: str = "") -> str:
+                                      prompt: str = "", avoid_days: int = 7) -> str:
             """Create a real Netease Cloud Music playlist.
 
             Same arguments and same contract as create_qq_playlist; songs are
             resolved through Netease cloud search, then added to a new playlist.
             """
             return await _create_from_list(Platform.NETEASE, songs_json, count,
-                                           playlist_name, date, prompt)
+                                           playlist_name, date, prompt, avoid_days)
 
         @mcp.tool()
         async def create_kugou_playlist(songs_json: str, count: int = 20,
                                         playlist_name: str = "", date: str = "",
-                                        prompt: str = "") -> str:
+                                        prompt: str = "", avoid_days: int = 7) -> str:
             """Create a real Kugou Music playlist.
 
             Same arguments and same contract as create_qq_playlist; songs are
             resolved through Kugou search, then added to a new playlist.
             """
             return await _create_from_list(Platform.KUGOU, songs_json, count,
-                                           playlist_name, date, prompt)
+                                           playlist_name, date, prompt, avoid_days)
 
         @mcp.tool()
         async def qq_recent() -> str:
@@ -407,11 +422,12 @@ def build_server(name: str) -> FastMCP:
                                         count: int = 40, playlist_name: str = "",
                                         date: str = "", prompt: str = "",
                                         include: str = "",
-                                        with_weather: bool = True) -> str:
+                                        with_weather: bool = True,
+                                        avoid_days: int = 7) -> str:
             """生成「今日歌单」：全平台候选池 -> 同一份歌单，多平台各建一份。
 
             候选池 = 所有平台的「今日推荐」+「全部收藏」去重（推荐优先），
-            自动避开最近 14 天推过的歌；然后**在每一个已登录的平台各建一份同名歌单**，
+            自动避开最近 avoid_days 天推过的歌；然后**在每一个已登录的平台各建一份同名歌单**，
             每首歌在目标平台现场搜索，找不到就跳过（记在该平台的 failed 里）。
 
             services: 平台列表，如 ["qq_music","netease","kugou"]；留空 = 全部平台。
@@ -419,21 +435,80 @@ def build_server(name: str) -> FastMCP:
             count:   要建多少首，随便填（默认 40，想要 100 首就传 100；池子不够时有多少给多少）。
             include: 点名想听的歌，逗号/分号/换行分隔，写成「歌名 - 歌手」，例如
                      "晴天 - 周杰伦, 海阔天空 - Beyond"。点名的歌一定排在最前面。
-            playlist_name: 指定歌单名；留空则自动 "<YYYYMMDD>-<主题>"。
-            prompt:  用户的原始请求。话里带心情/场景（「今天心情不好」）就直接拿它当主题，
-                     没带就按日期轮换一个主题，并参考当天天气 —— 保证每天不重样。
-            with_weather: 是否把当天天气纳入命名参考（默认 true；天气取不到不影响生成）。
+            avoid_days: 避开最近几天推过的歌（默认 7；给 0 = 完全不看去重池）。
+            playlist_name: 指定歌单名（**推荐**：先调 suggest_playlist_names 挑一个，
+                     或你自己起 —— 名字是给用户看的，你起得比内置规则好）。
+                     留空则自动 "<YYYYMMDD>-<主题>"，总长 ≤20 字（主题 ≤11 字）。
+            prompt:  用户的原始请求。话里带心情/场景（「今天心情不好」）、歌手名或年代
+                     （「邓紫棋2020年以前的歌」）就贴着它起名；什么都没说就随机抽素材
+                     （天气/时段/主题池），**不做**任何"雨天一定叫雨天窗边"的硬绑定。
+            with_weather: 天气是否参与命名（默认 true；可选项，取不到不影响生成）。
                      天气默认按出口 IP 定位，在服务器上会是机房所在地；想让天气贴合本城，
                      让用户设环境变量 MUSIC_WEATHER_CITY=城市名。
-            返回 {"ok","playlist_name","count","theme","weather","pool_size","pool_sources",
-                  "weather_hint","results":[{platform,...}]}。
+            返回 {"ok","playlist_name","theme","name_source","name_budget","recent_names",
+                  "avoid_days","count","weather","weather_hint","pool_size","pool_sources",
+                  "results":[{platform,...}]}。
+            name_source 说明名字怎么来的（explicit/mood/artist/year/artist+year/random）。
             某个平台没登录会在 results 里标 skipped=not_logged_in，不影响其他平台。
             若返回里 weather_hint 非空，把它转述给用户（提醒设置 MUSIC_WEATHER_CITY）。
             """
             target = services if services else ([service] if service else None)
             result = await compose.create_daily_playlist(target, count, playlist_name,
-                                                         date, prompt, include, with_weather)
+                                                         date, prompt, include, with_weather,
+                                                         avoid_days)
             return _dump(_with_login_options(result))
+
+        @mcp.tool()
+        async def suggest_playlist_names(prompt: str = "", date: str = "",
+                                         with_weather: bool = True, count: int = 3,
+                                         songs_json: str = "", artists: str = "") -> str:
+            """起名素材 + 候选名字：**给歌单起名优先用这个工具，而不是靠内置规则。**
+
+            你是 AI，起名这件事你比内置规则强，也更懂用户想要的那种"共鸣"
+            （今天天气怎样、他说了心情不好、他点了邓紫棋）。内置规则只负责"没人管时给个
+            不重复的名字"。
+
+            用法：调这个工具 → 从 candidates 里挑一个，或自己起一个 → 传给
+            create_daily_playlist / create_qq_playlist 等的 playlist_name。
+            prompt: 用户原话（用来提取心情 / 歌手 / 年代等线索），可以留空。
+            songs_json: 你手上那份曲目（和 create_*_playlist 同一个格式），**建议传**——
+                     名字要带上歌手（"邓紫棋2019以前"）就得知道有哪些歌手。
+                     不传就只能用日期/天气/心情/时段这些素材。
+            artists: 只要歌手名时可以用这个，逗号分隔，例如 "邓紫棋,周杰伦"。
+            count:  要几个候选（默认 3）。
+            with_weather: 是否把当天天气作为素材（默认 true，取不到不影响）。
+            Returns {"ok","materials","candidates","name_budget","recent_names","note"}。
+            name_budget: {"daily": 11, "manual": 20} —— 今日歌单会加 8 位日期前缀，
+            所以主题只有 11 个字可写；普通建单不带日期，最多 20 个字。
+            recent_names 是最近生成过的名字，用来避免"连着两天叫一样"。
+            """
+            day = date or time.strftime("%Y%m%d")
+            weather = await compose.current() if with_weather else {"ok": False}
+            # 曲目/歌手名单：没有它，"邓紫棋2020年以前的歌"里的歌手根本认不出来
+            songs: list[Song] = []
+            if songs_json.strip():
+                try:
+                    payload = json.loads(songs_json)
+                except json.JSONDecodeError as exc:
+                    return _dump({"ok": False, "error": f"invalid songs_json: {exc}"})
+                if isinstance(payload, list):
+                    payload = {"songs": payload}
+                if isinstance(payload, dict):
+                    songs = [Song(str(item.get("name") or ""), str(item.get("artist") or ""))
+                             for item in (payload.get("songs") or []) if isinstance(item, dict)]
+            if artists.strip():
+                songs += [Song("", part.strip()) for part in re.split(r"[,，;；\s]+", artists)
+                          if part.strip()]
+            material = compose.naming_material(prompt, day, weather, songs)
+            candidates = compose.naming_candidates(prompt, day, count, weather, songs)
+            return _dump(_with_login_options({
+                "ok": True, "date": day, "materials": material,
+                "candidates": candidates,
+                "name_budget": material["name_budget"],
+                "recent_names": material["recent_names"],
+                "note": "名字很随意，能让人有共鸣就行（今天的天气 / 他说的心情 / 时段都可以）。"
+                        "挑一个传 playlist_name 即可；留空则用内置规则自动起名。",
+            }))
 
         async def _liked_songs(service: Platform, limit: int = 0) -> dict[str, Any]:
             """收藏工具的公共实现：拉某平台的全部收藏（不是摘要）。"""

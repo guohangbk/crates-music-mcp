@@ -49,6 +49,9 @@ jobs:
       - name: 酷狗：签名/RSA/AES 与上游 JS 逐字节对拍
         run: python tests/test_kugou_native.py
 
+      - name: 歌单命名与台账（长度上限/指定优先/随机兜底/去重窗口/台账派生）
+        run: python tests/test_theme_naming.py
+
       - name: 画像权重 / 登录方式 / poll / stdio
         run: |
           python tests/test_profile_rank.py

@@ -4,7 +4,7 @@
 
 > ### 把你三个音乐 App 的收藏交给 Agent，让它每天替你挑一张对味的歌单。
 >
-> **网易云 · QQ 音乐 · 酷狗** —— 一个 MCP server、27 个工具、一份共享凭证、**零原生依赖**。
+> **网易云 · QQ 音乐 · 酷狗** —— 一个 MCP server、28 个工具、一份共享凭证、**零原生依赖**。
 
 大多数"音乐 MCP"只做一件事：把接口包一层，让模型能搜歌。这个包多做两步——
 **先读懂你的耳朵，再替你选歌**：
@@ -75,7 +75,7 @@ Agent：analyze_music_profile → 画像：偏爱华语流行 + 电子，常听 
        → 网易云《20261107-独处时光》40 首 / QQ音乐 40 首 / 酷狗 40 首
 ```
 
-## 27 个工具
+## 28 个工具
 
 **登录与凭证（8）**
 `login_methods` · `login_start` · `login_poll` · `login_submit` · `credential_status` · `credential_refresh` · `credential_set_cookie` · `credential_logout`
@@ -83,11 +83,11 @@ Agent：analyze_music_profile → 画像：偏爱华语流行 + 电子，常听 
 **画像与听歌数据（4）**
 `analyze_music_profile` · `get_profile` · `save_profile` · `recent_tracks`
 
-**歌单、搜索与推荐（15）**
+**歌单、搜索、命名与推荐（16）**
 `create_daily_playlist` · `create_qq_playlist` · `create_ncm_playlist` · `create_kugou_playlist` ·
 `liked_songs` · `ncm_liked_songs` · `search_songs` · `playlist_songs` · `add_songs_to_playlist` ·
-`recent_played` · `daily_recommendations` · `my_playlists` · `delete_playlist` ·
-`recent_recommended_tracks` · `qq_recent`
+`recent_played` · `suggest_playlist_names` · `daily_recommendations` · `my_playlists` ·
+`delete_playlist` · `recent_recommended_tracks` · `qq_recent`
 
 三个工具容易混，先分清：
 
@@ -95,7 +95,8 @@ Agent：analyze_music_profile → 画像：偏爱华语流行 + 电子，常听 
 | --- | --- | --- |
 | `liked_songs(service)` | 某平台**全部收藏**（「我喜欢」全量） | 不是统计摘要，也不是"最近听的" |
 | `recent_played(service)` | **用户最近听过的歌**（网易云听歌排行 / 酷狗听歌历史） | 不是我们推荐过的歌；QQ 暂不支持 |
-| `recent_recommended_tracks` / `recent_tracks` / `qq_recent` | **我们最近 14 天推荐过的歌**（建单去重用） | 与用户听歌历史无关（`qq_recent` 这名字是历史遗留，也不专指 QQ） |
+| `recent_recommended_tracks` / `recent_tracks` / `qq_recent` | **我们最近 7 天推荐过的歌**（建单去重用） | 与用户听歌历史无关（`qq_recent` 这名字是历史遗留，也不专指 QQ） |
+| `suggest_playlist_names` | 起名**素材**（今天天气/时段/心情/歌手/年代）+ 3 个候选 + 字数预算 | 它不建单，也不改任何东西；挑好名字再传给 `create_*_playlist` |
 
 ## 登录
 
@@ -140,10 +141,29 @@ create_daily_playlist(count=100, prompt="今天心情不好")      # 主题自�
 create_daily_playlist(include="晴天 - 周杰伦", count=20)     # 点名的歌排最前
 ```
 
-- 候选池 = 所有平台「今日推荐 + 全部收藏」去重，避开最近 14 天推过的
+- 候选池 = 所有平台「今日推荐 + 全部收藏」去重，**避开最近 7 天推过的**（`avoid_days` 可改，给 0 = 不避）
 - **画像权重选曲**：命中 `top_artists` 的歌 rank=2，命中 `mood_tendencies` 的 rank=1
 - 每首歌在目标平台现场搜索，找不到就跳过（记进 `failed`，绝不硬塞一首不相干的）
-- 歌单名 = `<日期>-<主题>`，主题取自心情 / 场景 / 天气
+- 歌单名见下面「歌单命名」
+
+## 歌单命名
+
+名字是给用户看的，规则只有两条：**指定优先、共鸣优先**。
+
+| 场景 | 例子 | 名字怎么来 |
+| --- | --- | --- |
+| Agent/用户给了名字 | 传 `playlist_name="我的私藏"` | 直接用（今日歌单也不加日期） |
+| 说了内容 | 「邓紫棋2020年以前的歌」 | `20261108-邓紫棋2019以前`（歌手 + 年代，**从话里抄**，不查曲目年份） |
+| 说了心情 | 「今天心情不好」 | `20261108-心情不好` |
+| 内容和心情都有 | 「写代码时听邓紫棋2019以前的歌」 | 内容优先，装得下就拼上心情：`邓紫棋2018以前 · 专注工作流` |
+| 什么都没说 | — | **随机抽素材**（天气/时段/主题池），不做任何"雨天一定叫雨天窗边"的硬绑定 |
+
+- **今日歌单**带 8 位日期前缀（`20261108-`），**普通建单不带**；名字总长 ≤20 字（所以今日歌单的主题只有 11 字）
+- 超长按素材优先级丢：先丢修饰（心情/场景），保住人名与用户指定词
+- **不做同日强幂等**：同一天重跑可以出不同名字；只有"随机来源"会避开最近 5 张用过的名字（开头词也避），避免"连着几天叫一样"
+- 想每天有惊喜：**让 agent 自己起名** —— 先调 `suggest_playlist_names` 拿素材和候选，再传给 `create_*_playlist`（agent 是 AI，比内置规则更懂"今天该叫什么"）
+
+生成过的歌单（连曲目）记在 `state/recent_playlist_history.json`（最近 100 张，只记日常歌单；手动建单不写）。这个台账是"我们最近推过什么"的**唯一来源**：去重池和 `recent_recommended_tracks` 都从它派生。
 
 ## 凭证 vault
 
@@ -227,7 +247,7 @@ music_mcp/
 
 ```bash
 pip install -e .
-python tests/test_stdio.py all    # 冒烟：27 个工具
+python tests/test_stdio.py all    # 冒烟：28 个工具
 python tests/test_methods.py      # 登录方式目录 + Cookie 导入 + 凭证状态
 python tests/test_analyze_all.py  # 三平台画像（需要本地已有凭证）
 ```
@@ -238,6 +258,7 @@ CI（`.github/workflows/ci.yml`）在每次 push / PR 跑 **离线**自检：
 | --- | --- |
 | `test_ncm_native.py`（默认不带 `NCM_LIVE=1`） | 密码学对 FIPS-197 / NIST SP 800-38A 官方向量，不需要账号 |
 | `test_kugou_native.py`（默认不带 `KUGOU_LIVE=1`） | 签名/RSA/AES 对上游 JS 的实际输出，参照值已固化进测试 |
+| `test_theme_naming.py` | 命名与台账全是本地逻辑（长度上限、指定优先、随机兜底、去重窗口），不需要网络 |
 | `test_profile_rank.py` / `test_methods.py` / `test_poll_fast.py` / `test_stdio.py` | 纯本地逻辑与 stdio 协议 |
 | 打包检查 | 构建 wheel/sdist，断言 `platforms/core/` 与 `LICENSE` 都在里面 |
 
