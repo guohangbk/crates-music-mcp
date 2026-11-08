@@ -41,7 +41,12 @@ cd crates-music-mcp
 pip install -e .
 ```
 
-> 目前**还没发布到 PyPI**，所以没有 `pip install crates-music-mcp` 这条路；上面两种是现在就能用的。
+已发布到 PyPI，任选一种装法：
+
+```bash
+uvx --from crates-music-mcp crates-music
+pip install crates-music-mcp
+```
 
 装完得到 4 个命令：
 
