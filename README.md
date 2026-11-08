@@ -266,6 +266,47 @@ CI（`.github/workflows/ci.yml`）在每次 push / PR 跑 **离线**自检：
 访问国内音乐接口不稳定，跑出来是假红。要验联网就看「自检」那一节，在本地跑。
 
 
+## 发布（PyPI）
+
+走 **Trusted Publishing（OIDC）**：仓库里不存任何 token，也不需要本地 twine。
+一次性配置（三处，拼错任何一处都会得到 `invalid-publisher` / 401）：
+
+1. PyPI 账号要有 2FA；**TestPyPI 是另一套账号**，练手前先注册一个。
+2. 两个站点各配一次 *pending publisher*（项目还不存在时只能走这个入口）：
+   正式 <https://pypi.org/manage/account/publishing/>、练手 <https://test.pypi.org/manage/account/publishing/>。
+
+   | 字段 | 填什么 |
+   | --- | --- |
+   | PyPI Project Name | `crates-music-mcp` |
+   | Owner | `guohangbk` |
+   | Repository name | `crates-music-mcp` |
+   | Workflow name | `publish.yml`（**文件名**，不是 workflow 里的 `name: Publish`） |
+   | Environment name | 正式 `pypi`，练手 `testpypi` |
+
+3. 仓库 Settings → Environments 建 `pypi` 与 `testpypi`，名字和上表**逐字一致**。
+   `pypi` 可以加 Required reviewers 做人工审批（加了之后自动触发也会停下来等人点）。
+
+每次发版：
+
+```bash
+# 1) 先改 pyproject.toml 的 version —— PyPI 不允许覆盖同名版本
+
+# 2) 练手（不污染正式包）
+gh workflow run publish.yml -f repository=testpypi
+pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ crates-music-mcp
+
+# 3) 正式：打 tag + 发 Release（必须是 published，草稿不触发）
+git tag v0.1.1 && git push origin v0.1.1
+gh release create v0.1.1 --generate-notes
+```
+
+装上之后（发布到 PyPI 后可用）：
+
+```bash
+uvx --from crates-music-mcp crates-music   # 一条命令跑通，不用先建 venv
+pip install crates-music-mcp               # 常规装法
+```
+
 ## 许可证
 
 [MIT](LICENSE)。三个平台的上游实现同样是 MIT——**我们只对齐了协议行为、没有复制它们的代码**：
