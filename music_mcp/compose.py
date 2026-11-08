@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import time
 from collections import Counter
@@ -43,31 +44,82 @@ MOOD_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("放松", "松弛", "疗愈", "安静", "平静", "放空"), "松弛时刻"),
 )
 
-# 没给任何线索时的主题池：按日期轮换，保证每天不重样
+# 名字上限与日期前缀（口径见下面 naming 那段注释）
+NAME_LIMIT = 20          # 名字最多 20 个字（今日歌单含日期前缀）
+DATE_PREFIX_LEN = 9      # "20261108-" 正好 9 个字符
+PLAYLIST_HISTORY_LIMIT = 100     # 台账只留最近 100 张歌单
+GENERIC_NAMES = {"歌单", "今日歌单", "每日歌单", "推荐歌单", "AI推荐", "ai推荐"}
+
+# 没给任何线索时的主题池：**随机抽**（不再是"按日期轮换"，
+# 那样会连着两天撞名，而且名字跟内容毫无关系）
 DEFAULT_THEMES: tuple[str, ...] = (
     "通勤电台", "深夜松弛", "午后漫游", "City Pop 时刻", "老歌翻新",
     "随机漫步", "独处时光", "多巴胺充电", "复古回潮", "耳机里的远方",
+    "窗边一隅", "慢速心跳", "深夜书房", "公路电影", "晚风电台",
+    "低电量模式", "想你的频率", "安静放电", "午夜便利店", "温柔着陆",
+    "旧唱片架", "清醒梦", "把音量调小", "阳光备用电源", "城市漫游指南",
+    "睡前十分钟", "周一续命", "下班路上", "雨天备用", "一个人的房间",
 )
 
-# 天气额外送的主题，按天气挑一个加进候选池
+# 时段 -> 共鸣词（"此刻"也是共鸣素材之一）
+HOUR_THEMES: tuple[tuple[int, int, str], ...] = (
+    (5, 9, "清晨电台"), (9, 12, "上午循环"), (12, 17, "午后漫游"),
+    (17, 20, "傍晚散场"), (20, 24, "夜里小声播放"), (0, 5, "凌晨三点的歌"),
+)
+
+# 天气 -> 共鸣词。**覆盖 WMO_TEXT 里全部 25 个词**：
+# 此前只有 14 个键，于是「毛毛雨 / 冻雨 / 雪粒 / 阵雪 / 强雷暴…」既没有 mood_hint
+# 也没有命名素材，直接漏掉（2026-11-08 实测：毛毛雨那天 mood_hint 是空的）。
 WEATHER_THEMES: dict[str, str] = {
     "晴": "晴天散步", "晴间多云": "多云也有光", "多云": "云层之下",
-    "阴": "阴天慢摇", "有雾": "雾里听歌", "小雨": "雨天窗边",
-    "中雨": "雨天窗边", "大雨": "雨天窗边", "暴雨": "暴雨耳机",
-    "阵雨": "阵雨轻爵士", "雷阵雨": "雷雨张力", "小雪": "初雪温柔",
-    "中雪": "初雪温柔", "大雪": "雪夜安静",
+    "阴": "阴天慢摇", "有雾": "雾里听歌", "雾凇": "雾凇与静电",
+    "毛毛雨": "毛毛细雨", "小雨": "雨天窗边", "中雨": "雨天窗边",
+    "大雨": "雨大屋里", "冻毛毛雨": "冻雨天不出门", "冻雨": "冻雨天不出门",
+    "强冻雨": "冻雨天不出门", "暴雨": "暴雨耳机", "阵雨": "阵雨轻爵士",
+    "强阵雨": "阵雨轻爵士", "小雪": "初雪温柔", "中雪": "初雪温柔",
+    "大雪": "雪夜安静", "雪粒": "雪粒打在窗上", "阵雪": "阵雪纷飞",
+    "强阵雪": "阵雪纷飞", "雷阵雨": "雷雨张力", "雷阵雨伴冰雹": "雷雨张力",
+    "强雷暴伴冰雹": "强雷暴夜里",
 }
 
 
-def _pick_by_date(options: list[str], date: str) -> str:
-    """按日期稳定地挑一个：同一天重复调用结果一致，隔天就换。"""
-    if not options:
-        return "AI推荐"
-    try:
-        seed = int(date or 0)
-    except ValueError:
-        seed = sum(ord(ch) for ch in str(date))
-    return options[seed % len(options)]
+# ---------------------------------------------------------------------------
+# 歌单命名
+#
+# 口径（2026-11-08 与用户定，别再改回"按日期轮换"）：
+#   * **共鸣优先、指定优先**：用户点名的名字直接用；说了心情/歌手/年代就贴着说；
+#     什么都没说就**随机抽素材**（天气 / 时段 / 主题池）—— 名字是很随意的东西，
+#     只要让人有共鸣就行；**不要**出现"雨天就一定叫雨天窗边"这种硬映射。
+#   * 今日歌单带 8 位日期前缀（`20261108-`），普通建单**不带**日期。
+#   * 名字 ≤20 字（今日歌单含前缀，所以主题只剩 11 字）；超长先丢修饰、保人名与指定词。
+#   * **不做同一天强幂等**：重跑可以出不同名字；只保证"单次调用内一致"。
+#   * 起名权优先给调用方（agent）：`suggest_playlist_names` 是唯一对外门面，
+#     这里只是它和 create_* 兜底共用的同一份引擎。
+# ---------------------------------------------------------------------------
+
+_SCENE_SEPARATOR = " · "
+
+
+def _rng(rng: Any = None) -> Any:
+    """随机源。传进来就用传进来的（测试可以固定种子），否则用模块级 random。"""
+    return rng if rng is not None else random
+
+
+def limit_name(name: str, budget: int) -> str:
+    """按字数裁剪：先丢修饰段（`·` 分隔的最后几段），实在放不下才硬截。"""
+    text = str(name or "").strip()
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+    parts = [part.strip() for part in re.split(r"[·×|/、,，]+", text) if part.strip()]
+    kept = ""
+    for part in parts:
+        candidate = f"{kept}{_SCENE_SEPARATOR}{part}" if kept else part
+        if len(candidate) > budget:
+            break
+        kept = candidate
+    return kept or text[:budget]
 
 
 def theme_from_prompt(prompt: str) -> str:
@@ -79,18 +131,247 @@ def theme_from_prompt(prompt: str) -> str:
     return ""
 
 
-def auto_theme(date: str, weather: dict[str, Any] | None = None) -> str:
-    """用户没说心情时，按日期 + 天气轮换一个主题。"""
-    options = list(DEFAULT_THEMES)
-    weather_text = str((weather or {}).get("weather") or "")
-    extra = WEATHER_THEMES.get(weather_text)
-    if extra:
-        options.insert(0, extra)
-    return _pick_by_date(options, str(date))
+_CJK_CHUNK = re.compile(r"[\u4e00-\u9fff]{2,}")
 
 
-def build_theme(prompt: str, date: str, weather: dict[str, Any] | None = None) -> str:
-    return theme_from_prompt(prompt) or auto_theme(date, weather)
+def _artist_aliases(name: str) -> list[str]:
+    """歌手名的候选写法：全名 + 其中的中文片段。
+
+    实测场景：曲库里是「G.E.M.邓紫棋」，而用户只会说「邓紫棋」——
+    直接拿全名去匹配永远不中，所以要把中文片段也当别名。
+    """
+    text = str(name or "").strip()
+    aliases = [text] if text else []
+    for chunk in _CJK_CHUNK.findall(text):
+        if chunk != text:
+            aliases.append(chunk)
+    return aliases
+
+
+def extract_artist_hint(prompt: str, artists: Any) -> str:
+    """用现成的歌手名单去用户话里找（不做中文分词）：命中里取最长的那个。"""
+    text = str(prompt or "")
+    if not text:
+        return ""
+    hits: list[str] = []
+    for artist in artists:
+        for alias in _artist_aliases(artist):
+            if len(alias) >= 2 and alias in text:
+                hits.append(alias)
+    return max(hits, key=len) if hits else ""
+
+
+_YEAR_RULES: tuple[tuple[re.Pattern[str], Any], ...] = (
+    # "2020年以前 / 之前 / 前" → 2019以前（减一年更好懂）
+    (re.compile(r"(20\d{2})\s*年?\s*(?:以前|之前|前)"),
+     lambda m: f"{int(m.group(1)) - 1}以前"),
+    (re.compile(r"(20\d{2})\s*年?\s*(?:及以前)"), lambda m: f"{m.group(1)}以前"),
+    (re.compile(r"(20\d{2})\s*年?\s*(?:之后|以后|起)"), lambda m: f"{m.group(1)}以后"),
+    (re.compile(r"(\d{2})\s*年代"), lambda m: f"{m.group(1)}年代"),
+    (re.compile(r"最近\s*(\d{1,2})\s*年"), lambda m: f"最近{m.group(1)}年"),
+    (re.compile(r"(20\d{2})\s*年"), lambda m: f"{m.group(1)}年"),
+)
+
+
+def extract_year_hint(prompt: str) -> str:
+    """用户话里的年代线索，**原样搬进名字**（不做真实年份计算，也就不用查曲目年份）。"""
+    text = str(prompt or "")
+    for pattern, render in _YEAR_RULES:
+        match = pattern.search(text)
+        if match:
+            return render(match)
+    return ""
+
+
+def _hour_word(when: float | None = None) -> str:
+    hour = time.localtime(when or time.time()).tm_hour
+    for start, end, word in HOUR_THEMES:
+        if start <= hour < end:
+            return word
+    return ""
+
+
+def _top_artist(artists: list[str], threshold: float = 0.5) -> str:
+    if not artists:
+        return ""
+    name, count = Counter(artists).most_common(1)[0]
+    return name if count / len(artists) >= threshold else ""
+
+
+def _too_similar(left: str, right: str, need: int = 2) -> bool:
+    """两个词有没有明显的共同部分（"雨天窗边" vs "雨天备用" → 是）。"""
+    if not left or not right:
+        return False
+    shared = sum(1 for char in set(left) if char in right)
+    return shared >= need
+
+
+def _random_theme(weather: dict[str, Any] | None, artists: list[str], rng: Any) -> str:
+    """没指定时的"共鸣"名字：随机抽素材拼，不做任何一一映射。"""
+    source = _rng(rng)
+    parts: list[str] = []
+    weather_word = WEATHER_THEMES.get(str((weather or {}).get("weather") or ""))
+    if weather_word and source.random() < 0.5:            # 天气可选，命中也不一定用
+        parts.append(weather_word)
+    options = list(DEFAULT_THEMES) + [_hour_word()]
+    scene = source.choice(options)
+    if parts and _too_similar(parts[0], scene):           # 别拼出"雨天窗边 · 雨天备用"
+        scene = source.choice([item for item in options if not _too_similar(parts[0], item)] or options)
+    parts.append(scene)
+    top = _top_artist(artists)                            # 曲库被某歌手占大半时偶尔带上
+    if top and source.random() < 0.34:
+        parts.append(top)
+    return _SCENE_SEPARATOR.join(part for part in parts if part)
+
+
+def build_theme(prompt: str, date: str, weather: dict[str, Any] | None = None,
+                songs: list[Song] | None = None, rng: Any = None) -> tuple[str, str]:
+    """没点名整名时定主题，返回 ``(主题, 来源)``。
+
+    来源：``mood``（心情词）/ ``artist`` / ``year`` / ``artist+year`` / ``random``。
+    顺序就是优先级：用户说过的 > 没说过时随机。
+    """
+    mood = theme_from_prompt(prompt)
+    artists = [song.artist for song in songs or () if song.artist]
+    artist = extract_artist_hint(prompt, artists)
+    year = extract_year_hint(prompt)
+    # 内容（歌手/年代）优先于心情：用户说"写代码时听邓紫棋2019以前的歌"时，
+    # "邓紫棋2019以前"比"专注工作流"更能说明这张单是什么。两个都有就拼接，
+    # 名字超长时 limit_name 会从后往前丢（先丢心情这项修饰）。
+    tail = f"{_SCENE_SEPARATOR}{mood}" if mood else ""
+    if artist and year:
+        return f"{artist}{year}{tail}", "artist+year" if not mood else "artist+year+mood"
+    if artist:
+        scene = _rng(rng).choice(list(DEFAULT_THEMES))
+        return f"{artist}{_SCENE_SEPARATOR}{scene}{tail}", "artist" if not mood else "artist+mood"
+    if year:
+        return f"{year}的老歌{tail}", "year" if not mood else "year+mood"
+    if mood:
+        return mood, "mood"
+    return _random_theme(weather, artists, rng), "random"
+
+
+AVOID_RECENT_THEMES = 5      # 随机名字避开最近这几张（不是硬保证，撞不上就换一个）
+
+
+def _recent_themes(limit: int = AVOID_RECENT_THEMES) -> set[str]:
+    return {str(row.get("theme") or "") for row in recent_playlists(limit) if row.get("theme")}
+
+
+def _recent_openers(limit: int = AVOID_RECENT_THEMES) -> set[str]:
+    """最近几张名字的**开头词**。
+
+    只比"整串是否相同"不够：「晴天散步」和「晴天散步 · 晚风电台」是两条不同的主题，
+    但用户看到的是"连着好几天都从晴天散步开头"。所以开头词也要避。
+    """
+    out: set[str] = set()
+    for theme in _recent_themes(limit):
+        out.add(theme.split(_SCENE_SEPARATOR)[0].strip())
+    return out
+
+
+def resolve_theme(prompt: str, explicit: str, date: str,
+                  weather: dict[str, Any] | None = None,
+                  songs: list[Song] | None = None, rng: Any = None) -> tuple[str, str]:
+    """定主题（不含日期前缀），返回 ``(主题, 来源)``。"""
+    explicit = str(explicit or "").strip()
+    text = str(prompt or "")
+    if explicit and explicit in text:
+        return limit_name(explicit, NAME_LIMIT), "explicit"     # 用户话里点名整名
+    if explicit and explicit not in GENERIC_NAMES:
+        return limit_name(explicit, NAME_LIMIT), "explicit"
+    theme, source = build_theme(prompt, date, weather, songs, rng)
+    if source == "random":
+        # 软规则：**随机**来源避开最近几张用过的（撞了就再抽，抽 3 次还撞就用）。
+        # 点名的来源不避重 —— 用户要的就是那个名字，重复才是对的。
+        taken = _recent_themes()
+        openers = _recent_openers()
+        for _ in range(4):
+            opener = theme.split(_SCENE_SEPARATOR)[0].strip()
+            if not taken or (theme not in taken and opener not in openers):
+                break
+            theme, source = build_theme(prompt, date, weather, songs, rng)
+    return limit_name(theme, NAME_LIMIT), source
+
+
+def resolve_name(prompt: str, explicit: str, date: str,
+                 weather: dict[str, Any] | None = None,
+                 songs: list[Song] | None = None,
+                 with_date: bool = True, rng: Any = None) -> str:
+    """歌单名。今日歌单 ``with_date=True``（``20261108-主题``）；普通建单 False（只有主题）。"""
+    explicit = str(explicit or "").strip()
+    if explicit and explicit in str(prompt or ""):
+        return limit_name(explicit, NAME_LIMIT)         # 点名整名：不加日期也不裁
+    theme, _ = resolve_theme(prompt, explicit, date, weather, songs, rng)
+    if not with_date:
+        return limit_name(theme, NAME_LIMIT)
+    # 先给主题留预算再拼日期，免得截断时把日期切掉
+    return f"{date}-{limit_name(theme, NAME_LIMIT - DATE_PREFIX_LEN)}"
+
+
+def naming_material(prompt: str = "", date: str = "",
+                    weather: dict[str, Any] | None = None,
+                    songs: list[Song] | None = None) -> dict[str, Any]:
+    """给调用方（agent）起名用的素材包：今天是什么日子、手里有哪些词。"""
+    artists = [song.artist for song in songs or () if song.artist]
+    counters = Counter(artists)
+    return {
+        "date": str(date or time.strftime("%Y%m%d")),
+        "hour_word": _hour_word(),
+        "weather": str((weather or {}).get("weather") or ""),
+        "weather_word": WEATHER_THEMES.get(str((weather or {}).get("weather") or ""), ""),
+        "weather_mood": WEATHER_MOOD.get(str((weather or {}).get("weather") or ""), ""),
+        "mood_from_prompt": theme_from_prompt(prompt),
+        "artist_from_prompt": extract_artist_hint(prompt, artists),
+        "year_from_prompt": extract_year_hint(prompt),
+        "top_artists": [name for name, _ in counters.most_common(5)],
+        "recent_names": [str(row.get("name") or "") for row in recent_playlists(5)],
+        "name_budget": {"daily": NAME_LIMIT - DATE_PREFIX_LEN, "manual": NAME_LIMIT},
+    }
+
+
+def naming_candidates(prompt: str = "", date: str = "", count: int = 3,
+                      weather: dict[str, Any] | None = None,
+                      songs: list[Song] | None = None) -> list[dict[str, str]]:
+    """给几个候选名字（含来源），供 agent 挑选或参考。
+
+    指定了内容（歌手/年代）时也补几个"换个场景/只留随机素材"的变体 ——
+    agent 需要的是**能挑**，而不是只有一个答案。
+    """
+    want = max(1, int(count or 3))
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    first_theme, first_source = build_theme(prompt, date, weather, songs)
+    first_theme = limit_name(first_theme, NAME_LIMIT)
+    if first_theme:
+        seen.add(first_theme)
+        out.append({"theme": first_theme, "source": first_source})
+    artists = [song.artist for song in songs or () if song.artist]
+    artist = extract_artist_hint(prompt, artists)
+    mood = theme_from_prompt(prompt)
+    variants: list[tuple[str, str]] = []
+    if artist:                                    # 同一个歌手的其他场景
+        for scene in list(DEFAULT_THEMES)[:6]:
+            variants.append((f"{artist}{_SCENE_SEPARATOR}{scene}", "artist+换场景"))
+    if mood:                                      # 心情本身也是一条路
+        variants.append((mood, "mood"))
+    variants.append((_random_theme(weather, artists, None), "random"))
+    for theme, source in variants:
+        if len(out) >= want:
+            break
+        theme = limit_name(theme, NAME_LIMIT)
+        if theme and theme not in seen:
+            seen.add(theme)
+            out.append({"theme": theme, "source": source})
+    for _ in range(want * 3):                     # 还不够就再随机抽几个
+        if len(out) >= want:
+            break
+        theme, source = build_theme(prompt, date, weather, songs)
+        theme = limit_name(theme, NAME_LIMIT)
+        if theme and theme not in seen:
+            seen.add(theme)
+            out.append({"theme": theme, "source": source})
+    return out
 
 
 CACHE_TTL = 3600
@@ -110,11 +391,17 @@ WMO_TEXT = {
 WEATHER_MOOD = {
     "晴": "晴天适合轻快明亮", "晴间多云": "阳光忽隐忽现，来点 City Pop",
     "多云": "多云天适合慢摇", "阴": "阴天适合安静一点",
-    "有雾": "有雾的天气适合氛围感", "小雨": "雨天适合窗边慢歌",
+    "有雾": "有雾的天气适合氛围感", "雾凇": "雾凇天适合冷冽清透的声音",
+    "毛毛雨": "毛毛细雨，来点轻一点的钢琴", "小雨": "雨天适合窗边慢歌",
     "中雨": "雨天适合窗边慢歌", "大雨": "雨大，适合窝着听歌",
-    "暴雨": "暴雨天，适合沉一点的声音", "阵雨": "阵雨天适合轻爵士",
-    "雷阵雨": "雷雨天适合有张力一点的歌", "小雪": "下雪了，适合温柔的歌",
-    "中雪": "下雪了，适合温柔的歌", "大雪": "大雪天适合安静的歌",
+    "冻毛毛雨": "冻雨天适合待在屋里的暖歌", "冻雨": "冻雨天适合待在屋里的暖歌",
+    "强冻雨": "冻雨天适合待在屋里的暖歌", "暴雨": "暴雨天，适合沉一点的声音",
+    "阵雨": "阵雨天适合轻爵士", "强阵雨": "阵雨天适合轻爵士",
+    "小雪": "下雪了，适合温柔的歌", "中雪": "下雪了，适合温柔的歌",
+    "大雪": "大雪天适合安静的歌", "雪粒": "雪粒天适合干净的器乐",
+    "阵雪": "阵雪天适合轻飘的旋律", "强阵雪": "阵雪天适合轻飘的旋律",
+    "雷阵雨": "雷雨天适合有张力一点的歌", "雷阵雨伴冰雹": "雷雨天适合有张力一点的歌",
+    "强雷暴伴冰雹": "强雷暴适合低频重一点的歌",
 }
 
 
@@ -204,8 +491,8 @@ async def current(city: str = "") -> dict[str, Any]:
     return value
 
 
-RECENT_DAYS = 14
-MAX_HISTORY = 400
+RECENT_DAYS = 7          # 选曲去重窗口：默认 7 天，agent 可用 avoid_days 覆盖（原写死 14）
+MAX_HISTORY = 400        # 去重池最多记多少首
 
 
 def _history_file() -> Path:
@@ -214,8 +501,14 @@ def _history_file() -> Path:
     return state / paths.RECENT_FILENAME
 
 
+def _playlist_history_file() -> Path:
+    state = paths.state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    return state / paths.PLAYLIST_HISTORY_FILENAME
+
+
 def _read_raw() -> Path | None:
-    """新名字优先；只在旧文件还在（迁移前）时读旧的。"""
+    """旧文件（recent_music_history.json）的兼容读：新名优先，再退更老的名字。"""
     path = _history_file()
     if path.exists():
         return path
@@ -226,35 +519,100 @@ def _read_raw() -> Path | None:
     return None
 
 
-def recent_songs(days: int = RECENT_DAYS) -> list[dict[str, Any]]:
-    """最近 days 天内推过的歌（空文件 / 坏文件都当没有历史）。"""
-    source = _read_raw()
-    if source is None:
-        return []
+# ---------------------------------------------------------------------------
+# 歌单台账（state/recent_playlist_history.json）
+#
+# 它是"我们最近生成过什么"的**唯一事实来源**：选曲去重池（recent_songs/recent_keys）
+# 和 recent_tracks 工具都从它派生。每张歌单连**曲目**一起记，所以"上周三那张里有啥"
+# 直接可查，不用再翻别的地方。
+#   历史：以前只记歌（recent_music_history.json，没有歌单维度）—— 那个文件现已停止写入，
+#   读取仍兼容（老数据 7 天后自然过期，之后可以把这个兼容分支删掉）。
+#   只记日常歌单；**手动建单不写**（用户明确要那份清单，不该污染日常去重池）。
+# ---------------------------------------------------------------------------
+
+def recent_playlists(limit: int = 0) -> list[dict[str, Any]]:
+    """歌单台账，新 → 旧。``limit=0`` 表示全部。"""
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload = json.loads(_playlist_history_file().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
-    cutoff = time.time() - days * 86400
-    return [item for item in payload.get("songs", [])
-            if isinstance(item, dict) and float(item.get("timestamp") or 0) >= cutoff]
+    rows = [row for row in (payload.get("playlists") or []) if isinstance(row, dict)]
+    return rows[:limit] if limit and limit > 0 else rows
+
+
+def recent_playlist_names(limit: int = 5) -> list[str]:
+    """最近生成过的歌单名（给返回值 / 起名工具做参考）。"""
+    return [str(row.get("name") or "") for row in recent_playlists(limit) if row.get("name")]
+
+
+def record_playlist(*, name: str, date: str = "", theme: str = "", name_source: str = "",
+                    platforms: list[str] | None = None,
+                    songs: list[dict[str, str]] | None = None,
+                    kind: str = "daily") -> dict[str, Any]:
+    """把一次**成功**建单写进台账（只留最近 PLAYLIST_HISTORY_LIMIT 张）。"""
+    entry: dict[str, Any] = {
+        "name": str(name or ""), "date": str(date or ""), "theme": str(theme or ""),
+        "name_source": str(name_source or ""), "kind": str(kind or "daily"),
+        "platforms": [str(item) for item in (platforms or [])],
+        "songs": [{"name": str(song.get("name") or ""), "artist": str(song.get("artist") or "")}
+                  for song in (songs or []) if isinstance(song, dict) and song.get("name")],
+        "created_at": time.time(),
+    }
+    rows = [entry, *recent_playlists()]
+    _playlist_history_file().write_text(
+        json.dumps({"updated_at": time.time(),
+                    "playlists": rows[:PLAYLIST_HISTORY_LIMIT]},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    return entry
+
+
+def recent_songs(days: int = RECENT_DAYS) -> list[dict[str, Any]]:
+    """去重池：最近 ``days`` 天生成过的歌（``days=0`` = 不去重）。
+
+    来源：① 歌单台账里的曲目（唯一写入方）；② 旧文件 recent_music_history.json（兼容读）。
+    """
+    window = max(0, int(days))
+    cutoff = time.time() - window * 86400
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in recent_playlists():
+        when = float(row.get("created_at") or 0)
+        if when < cutoff:
+            continue
+        for song in row.get("songs") or []:
+            key = song_key(song.get("name"), song.get("artist"))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append({"name": song.get("name"), "artist": song.get("artist"),
+                        "timestamp": when})
+            if len(out) >= MAX_HISTORY:
+                return out
+    source = _read_raw()
+    if source is not None and window > 0:
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        for item in payload.get("songs", []):
+            if not isinstance(item, dict):
+                continue
+            if float(item.get("timestamp") or 0) < cutoff:
+                continue
+            key = song_key(item.get("name"), item.get("artist"))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+            if len(out) >= MAX_HISTORY:
+                break
+    return out
 
 
 def recent_keys(days: int = RECENT_DAYS) -> set[str]:
+    """去重池的 key 集合（选曲时用来避开最近推过的歌）。"""
     return {song_key(item.get("name"), item.get("artist")) for item in recent_songs(days)}
-
-
-def record_songs(songs: list[dict[str, str]]) -> None:
-    """把这次生成的歌写进历史（已记过的不重复记）。"""
-    now = time.time()
-    history = recent_songs(days=MAX_HISTORY)  # 用足够长的窗口避免重复写
-    seen = {song_key(item.get("name"), item.get("artist")) for item in history}
-    additions = [{"name": song["name"], "artist": song.get("artist", ""), "timestamp": now}
-                 for song in songs if song_key(song["name"], song.get("artist")) not in seen]
-    _history_file().write_text(
-        json.dumps({"updated_at": now, "songs": (additions + history)[:MAX_HISTORY]},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8")
 
 
 def _write(path: Path, payload: Any) -> None:
@@ -440,13 +798,15 @@ def parse_include(text: str) -> list[Song]:
 
 
 def select_songs(songs: list[Song], count: int,
-                 include: list[Song] | None = None) -> tuple[list[Song], int]:
-    """去重 -> 优先挑最近 14 天没推过的 -> 取前 count 首。
+                 include: list[Song] | None = None,
+                 avoid_days: int = RECENT_DAYS) -> tuple[list[Song], int]:
+    """去重 -> 优先挑最近 ``avoid_days`` 天没推过的 -> 取前 count 首。
 
     include 里点名的歌**永远排在前面**（用户要的必须进），剩下的用池子补齐。
+    ``avoid_days`` 由调用方决定（默认 7 天）：给 0 就是"不看去重池，随便挑"。
     返回 (选中的, 复用了几首)。
     """
-    recent = recent_keys()
+    recent = recent_keys(avoid_days)
     seen: set[str] = set()
     unique: list[Song] = []
     by_key: dict[str, Song] = {}
@@ -478,26 +838,11 @@ def select_songs(songs: list[Song], count: int,
     return selected, reused
 
 
-def resolve_name(prompt: str, explicit: str, date: str,
-                 weather: dict[str, Any] | None = None) -> str:
-    """歌单名：``<日期>-<主题>``。
-
-    主题来源优先级：用户明确点名的名字 > 用户话里的心情/场景（「今天心情不好」）
-    > 按日期轮换（每天不重样）并参考当天天气。
-    """
-    explicit = str(explicit or "").strip()
-    if explicit and (explicit in prompt or any(marker in prompt for marker in
-                                               ("歌单名", "命名", "取名", "叫做", "叫"))):
-        return explicit
-    theme = explicit if explicit and explicit not in {"歌单", "今日歌单", "AI推荐", "每日歌单"} \
-        else build_theme(prompt, date, weather)
-    return f"{date}-{theme}"
-
-
 async def create_daily_playlist(services: Any = "", count: int = 40,
                                 playlist_name: str = "", date: str = "",
                                 prompt: str = "", include: str = "",
-                                with_weather: bool = True) -> dict[str, Any]:
+                                with_weather: bool = True,
+                                avoid_days: int = RECENT_DAYS) -> dict[str, Any]:
     """今日歌单：全平台池子挑 count 首 -> 每个已登录平台各建一份同名歌单。"""
     pool = await build_pool(services)
     if not pool["songs"]:
@@ -508,8 +853,10 @@ async def create_daily_playlist(services: Any = "", count: int = 40,
 
     day = date or time.strftime("%Y%m%d")
     weather = await current() if with_weather else {"ok": False}
-    selected, reused = select_songs(pool["songs"], count, parse_include(include))
-    name = resolve_name(prompt, playlist_name, day, weather)
+    selected, reused = select_songs(pool["songs"], count, parse_include(include), avoid_days)
+    # 今日歌单：8 位日期前缀必须保留，所以先给主题留预算再拼，截断不会切到日期
+    theme, name_source = resolve_theme(prompt, playlist_name, day, weather, selected)
+    name = f"{day}-{limit_name(theme, NAME_LIMIT - DATE_PREFIX_LEN)}"
 
     results: list[dict[str, Any]] = []
     for key in pool["services"]:
@@ -528,15 +875,29 @@ async def create_daily_playlist(services: Any = "", count: int = 40,
             results.append({"platform": key_of(key), "ok": False, "playlist_name": name,
                             "error": f"{exc.__class__.__name__}: {exc}"})
 
-    # 历史只记「真的加进去的歌」，按平台各记一份（找不到的自然不在 matched 里）
-    for item in results:
-        if item.get("ok") and item.get("matched"):
-            record_songs(list(item["matched"]))
     created = [item for item in results if item.get("ok")]
+    if created:
+        # 台账记「真的加进去的歌」（多平台合并去重后一份）
+        merged: list[dict[str, str]] = []
+        seen_keys: set[str] = set()
+        for item in created:
+            for song in item.get("matched") or []:
+                key = song_key(song.get("name"), song.get("artist"))
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    merged.append({"name": str(song.get("name") or ""),
+                                   "artist": str(song.get("artist") or "")})
+        record_playlist(name=name, date=day, theme=theme, name_source=name_source,
+                        platforms=[str(item.get("platform") or "") for item in created],
+                        songs=merged, kind="daily")
     return {"ok": bool(created), "playlist_name": name, "count": len(selected),
             "services": pool["services"], "pool_size": len(pool["songs"]),
             "pool_sources": pool["sources"], "reused_recent": reused,
-            "theme": name.split("-", 1)[-1],
+            "theme": theme, "name_source": name_source,
+            # 起名/改名用：主题还能写几个字、最近生成过什么名字
+            "name_budget": NAME_LIMIT - DATE_PREFIX_LEN,
+            "recent_names": recent_playlist_names(5),
+            "avoid_days": avoid_days,
             "weather": weather,
             # 服务器上按 IP 定位时把「提醒用户设 MUSIC_WEATHER_CITY」透出来，agent 直接转述即可
             "weather_hint": weather.get("hint", "") if isinstance(weather, dict) else "",

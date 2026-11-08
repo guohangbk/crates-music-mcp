@@ -64,7 +64,8 @@ def describe() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 PROFILE_FILENAME = "music_prefer_profile.json"
-RECENT_FILENAME = "recent_music_history.json"
+RECENT_FILENAME = "recent_music_history.json"   # 旧文件：已停止写入，仅兼容读
+PLAYLIST_HISTORY_FILENAME = "recent_playlist_history.json"   # 歌单台账（含曲目）
 
 # 旧名字，只为兼容读取（读到就顺手迁到新名字）；新代码一律不要再写这些
 LEGACY_PROFILE_FILENAMES = ("profile.json", "profile_summary.json")
